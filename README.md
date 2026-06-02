@@ -316,25 +316,36 @@ tracker:
 </details>
 
 <details>
-<summary><b>controller</b> — 键鼠控制</summary>
+<summary><b>controller</b> — 鼠标控制（只用鼠标，不走键盘）</summary>
 
 ```yaml
 controller:
   mouse_sensitivity: 1.0    # 鼠标移动灵敏度
-  throw_hold_time: 500      # 丢球蓄力时间 (ms)
+  throw_hold_time: 500      # 长按时间 (ms)
   click_delay: 100          # 点击间隔 (ms)
   keyboard_device: /dev/hidg0
-  mouse_device: /dev/hidg1
+  mouse_device: /dev/hidg1  # 若不存在会自动用 find_mouse_hid() 探测
   keymap:
-    interact: w             # 交互键
-    throw_ball: r           # 丢球键
-    run: shift              # 奔跑键
+    interact: w
+    throw_ball: r
+    run: shift
     skill1: "1"
     skill2: "2"
     escape: esc
     confirm: enter
-    focus: x                # 聚能键
+    focus: x
+  aim:
+    move_steps: 20          # 鼠标平滑移动步数
+    step_delay: 2           # 每步间隔 (ms)
+    settle_delay: 80        # 到达后稳定 (ms)
+  calibration:              # 采集画面 → 游戏画面坐标校准
+    offset_x: 0
+    offset_y: 0
+    scale_x: 1.0
+    scale_y: 1.0
 ```
+
+> ⚠️ **鼠标设备自动发现**：`mouse_device` 配置的路径如果不存在（如 `/dev/hidg1`），`controller.py` 会通过 `find_mouse_hid()` 在 configfs 中搜索 `hid.mouse` 对应的实际 `/dev/hidg*` 节点。`rockchip-mouse` 模式下节点通常是 `/dev/hidg2`。
 </details>
 
 <details>
@@ -399,13 +410,15 @@ UI 模板匹配以 OpenCV TM_CCOEFF_NORMED 方式与 YOLO 并行运行。
 
 1. **SCAN**：每 0.5s 检测画面中的精灵
 2. **TRACK**：卡尔曼滤波追踪精灵位置，处理短暂遮挡
-3. **AIM**：确认目标锁定，等待追踪稳定（150ms 停顿）
-4. **THROW**：长按 R 键丢球（游戏自动瞄准最近精灵），最多尝试 3 次
+3. **AIM**：**按住鼠标左键** + 移动光标到精灵位置（只用鼠标，不走键盘）
+4. **THROW**：**松开左键 = 丢球**，最多尝试 3 次
 5. **VERIFY**：四步判定 —
    - 检测"捕捉成功"UI → 成功
    - 检测"捕捉失败"UI → 失败，重试
    - 精灵仍在画面中 → 失败，重试
    - 检测"战斗界面"UI → 进入战斗
+
+> ⚠️ **只用鼠标丢球，键盘不可用。** 游戏只响应鼠标操作，不要使用键盘 R 键等其他方式。
 
 ---
 
@@ -414,7 +427,7 @@ UI 模板匹配以 OpenCV TM_CCOEFF_NORMED 方式与 YOLO 并行运行。
 ### 短期（待完善）
 
 - [x] **模型训练/微调** — 训练工具链已完成（`scripts/capture_screenshots.py` + `label_tool.py` + `train_model.py`），**待采集标注数据后实际训练**
-- [x] **丢球操作修正** — 从鼠标长按改为键盘 R 键长按（游戏自动瞄准）
+- [x] **丢球操作修正** — 按住左键瞄准 + 松开左键丢球（纯鼠标，游戏自动瞄准）
 - [x] **捕捉验证增强** — 四步判定：成功UI / 失败UI / 精灵存在 / 战斗UI
 - [ ] **模型训练执行** — 采集 50-100+ 张游戏截图并用 label_tool 标注，然后运行 train_model.py
 - [ ] **游戏兼容性** — 适配更多分辨率、不同战斗场景
@@ -493,14 +506,45 @@ UI 模板匹配以 OpenCV TM_CCOEFF_NORMED 方式与 YOLO 并行运行。
 | Mouse-only controller | ✅ `GameController.open()` 已允许键盘缺失时使用鼠标控制 |
 | HDMI 采集 | ✅ `/dev/video0` 为 `rk_hdmirx`，OpenCV 成功读取 1920×1080 帧 |
 | Manual 模式 | ✅ `python3 main.py manual` 可启动采集与 motion 检测 |
-| HDMI 采集设备 | ⚠️ 当前 `/dev/video0` 不存在，无法实测采集画面 |
-| NPU 设备 | ⚠️ 当前 `/dev/rknpu` 不存在，无法实测 RKNN 推理 |
 
-注意：当前 configfs 中旧 gadget 仍显示鼠标 `report_length=6`，需要执行下面命令重启 gadget 后，新的 4 字节描述符才会生效：
+### 当前 HID 使用注意事项
+
+- 当前稳定可用的是复用系统默认 gadget 的鼠标模式：
 
 ```bash
-sudo bash setup_gadget.sh restart
+sudo bash setup_gadget.sh rockchip-mouse
 ```
+
+- 不要使用 `sudo bash setup_gadget.sh restart mouse`；`roco_gadget` 路径在当前板子上会退回 `default`，Windows 可能显示未知 USB 设备。
+- `rockchip-mouse` 模式下鼠标 HID 节点可能是 `/dev/hidg1`、`/dev/hidg2` 等，取决于当前 configfs function 创建顺序。`controller.py` 已内置 `find_mouse_hid()` 自动探测正确节点。
+- 鼠标功能测试脚本：
+
+```bash
+python3 tools/test_mouse_hid.py
+```
+
+- 若脚本报 `UDC is not configured`，先确认：
+
+```bash
+cat /sys/class/udc/fc000000.usb/state
+bash setup_gadget.sh status
+```
+
+- NPU 设备 `/dev/rknpu` 当前尚未完成实测，RKNN 模型推理仍待验证。
+
+### 2026-06-02 鼠标自动丢球更新
+
+| 项目 | 结果 |
+|------|------|
+| 状态机 IDLE bug 修复 | ✅ `run()` 不再重置状态到 IDLE |
+| 鼠标设备自动发现 | ✅ `find_mouse_hid()` 通过 configfs 探测 `/dev/hidg*` |
+| UDC 状态检查 | ✅ `GameController.open()` 先检查 `hid_transport_ready()` |
+| 鼠标瞄准 | ✅ AIM 状态：按住左键 + 移动光标到精灵位置 |
+| 鼠标丢球 | ✅ THROW 状态：松开左键 = 丢球 |
+| 键盘丢球 | ❌ 已移除 — 游戏只响应鼠标操作 |
+| HDMI 采集 | ✅ GStreamer v4l2src io-mode=4, 1920×1080 |
+| OpenCV 显示 | ✅ debug 模式窗口在 GStreamer 前创建，无 Qt/GLib 冲突 |
+| motion 检测 + 状态机循环 | ✅ scan → track → aim → throw → verify 完整跑通 |
 
 ---
 

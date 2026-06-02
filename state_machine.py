@@ -19,9 +19,9 @@ import enum
 import os
 import threading
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
-from utils import log, Timer
+from utils import log, Timer, distance
 
 
 # ============================================================
@@ -171,10 +171,9 @@ class CaptureStateMachine:
         Args:
             stop_event: 线程事件，设置后退出循环
         """
-        self._state = State.IDLE
         self._timer.reset()
 
-        log.info("State machine starting...")
+        log.info(f"State machine starting from {self._state.value}...")
 
         try:
             while stop_event is None or not stop_event.is_set():
@@ -424,6 +423,7 @@ class CapturePipeline:
         # 当前目标
         self._current_target: Optional[dict] = None
         self._throw_count = 0
+        self._target_position: Optional[Tuple[int, int]] = None
 
         # 注册状态回调
         self._register_callbacks()
@@ -502,44 +502,52 @@ class CapturePipeline:
         # 获取追踪位置
         pos = self.tracker.get_target_position()
         if pos is not None:
+            self._target_position = pos
             return Event.TARGET_LOCKED
 
         return Event.NO_SPRITE
 
     def _on_aim(self) -> Optional[Event]:
-        """确认目标已锁定，等待稳定后准备丢球。"""
-        # 确认追踪器仍然有目标
+        """按住左键瞄准：移动光标到精灵 + 按住左键不放。"""
         pos = self.tracker.get_target_position()
         if pos is None:
             return Event.NO_SPRITE
 
-        # 不做鼠标瞄准（游戏用 R 键自动瞄准），
-        # 只做短暂停顿让追踪稳定
-        time.sleep(0.15)
+        self._target_position = pos
 
-        if self._current_target:
-            log.info(f"Aiming at sprite: "
-                     f"class={self._current_target.get('class', '?')} "
-                     f"tracker_id={self._current_target.get('tracker_id', '?')}")
+        if self.controller is not None:
+            cls = self._current_target.get('class', '?') if self._current_target else '?'
+            log.info(f"Aim: holding LEFT button, target={cls} pos={pos}")
+            self.controller.start_aim(pos[0], pos[1])
+
+            # 短暂跟踪：移动后重新检测，精灵动了就微调
+            new_pos = self.tracker.get_target_position()
+            if new_pos is not None:
+                drift = distance(pos, new_pos)
+                if drift > 30:
+                    self.controller.aim_at_target(new_pos[0], new_pos[1])
+                    self._target_position = new_pos
+        else:
+            time.sleep(0.15)
 
         return Event.AIM_READY
 
     def _on_throw(self) -> Optional[Event]:
-        """长按 R 键丢球（游戏自动瞄准最近精灵）。"""
+        """松开左键 = 丢球！"""
         self._throw_count += 1
         self.fsm.record_throw()
 
-        log.info(f"Throw attempt {self._throw_count}/{self.max_throw_attempts}")
+        log.info(f"Throw {self._throw_count}/{self.max_throw_attempts}: "
+                 f"releasing LEFT button")
 
         if self.controller is None:
             log.warning("Controller unavailable, simulating throw")
-            time.sleep(self.throw_hold_time)
+            time.sleep(0.5)
             return Event.THROW_DONE
 
-        # 长按 R 键蓄力丢球
-        self.controller.throw_ball()
+        self.controller.release_throw()
 
-        time.sleep(0.5)  # 等待动画
+        time.sleep(0.5)  # 等待投掷动画
         return Event.THROW_DONE
 
     def _on_verify(self) -> Optional[Event]:

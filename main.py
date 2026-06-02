@@ -9,7 +9,7 @@
 
 依赖:
   - HDMI 输入 (/dev/video0) 已连接 Windows PC
-  - (auto 模式) USB HID gadget 已配置: sudo bash setup_gadget.sh start
+  - (auto 模式) USB HID gadget 已配置: sudo bash setup_gadget.sh rockchip-mouse
 """
 
 import argparse
@@ -109,7 +109,36 @@ class RocoAutoCapture:
         log.info("  T    : toggle template matching on/off")
         log.info("=" * 60)
 
+        # 诊断：检查显示环境
+        import os as _os
+        _display = _os.environ.get("DISPLAY", "")
+        log.info(f"DISPLAY={_display or '(not set!)'}")
+
+        if not _display:
+            log.error("No DISPLAY environment variable set!")
+            log.error("If using SSH, reconnect with: ssh -X orangepi@host")
+            log.error("Or run directly on the Orange Pi's terminal with a monitor attached.")
+            return
+
+        # 必须在 GStreamer 之前创建 OpenCV 窗口，否则 Qt/GLib 主上下文冲突
+        log.info("Creating debug window (960x540) before GStreamer init...")
+        cv2.namedWindow("RocoAutoCapture — DEBUG", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("RocoAutoCapture — DEBUG", 960, 540)
+
         if not self._init_capture():
+            return
+
+        # 等待第一帧确保采集正常
+        log.info("Waiting for first frame...")
+        for i in range(50):
+            frame = self._stream.get_frame()
+            if frame is not None:
+                log.info(f"First frame OK: shape={frame.shape}, mean={frame.mean():.1f}")
+                break
+            time.sleep(0.05)
+        else:
+            log.error("No frame received after 2.5s! Check HDMI connection.")
+            self._stream.stop()
             return
 
         self._init_detector()
@@ -123,7 +152,8 @@ class RocoAutoCapture:
         )
 
         show_templates = True
-        last_save = 0
+
+        log.info("GStreamer capture started. Press ESC to exit, SPACE to save snapshot.")
 
         try:
             while not self.stop_event.is_set():
@@ -265,7 +295,7 @@ class RocoAutoCapture:
         # 检查 USB gadget
         if not (Path("/dev/hidg0").exists() and Path("/dev/hidg1").exists()):
             log.warning("HID devices not found!")
-            log.warning("Run: sudo bash setup_gadget.sh start")
+            log.warning("Run: sudo bash setup_gadget.sh rockchip-mouse")
             log.warning("Continuing without input control...")
 
         if not self._init_capture():
@@ -398,7 +428,6 @@ Examples:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="日志级别 (default: INFO)",
     )
-
     args = parser.parse_args()
 
     # 设置日志

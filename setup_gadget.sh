@@ -120,6 +120,12 @@ stop_gadget() {
 # ============================================================
 
 start_gadget() {
+    if [ "$MODE" = "mouse" ]; then
+        echo "[!] roco_gadget mouse mode is disabled on this board."
+        echo "[!] Use: sudo bash setup_gadget.sh rockchip-mouse"
+        exit 1
+    fi
+
     echo "[*] Setting up USB HID Gadget..."
     echo "  Mode: $MODE"
 

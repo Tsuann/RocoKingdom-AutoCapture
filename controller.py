@@ -35,6 +35,42 @@ def hid_transport_ready() -> bool:
     return False
 
 
+def find_mouse_hid() -> str:
+    """在 configfs 中查找 hid.mouse 对应的 /dev/hidg* 设备节点。
+
+    参考 tools/test_mouse_hid.py，用 major:minor 精确匹配，
+    因为节点名（/dev/hidg0, /dev/hidg1, /dev/hidg2...）随
+    configfs function 创建顺序变化。
+    """
+    gadget_root = os.path.join("/", "sys", "kernel", "config", "usb_gadget")
+    try:
+        for func_dir in os.listdir(gadget_root):
+            func_path = os.path.join(gadget_root, func_dir, "functions")
+            if not os.path.isdir(func_path):
+                continue
+            mouse_dev = os.path.join(func_path, "hid.mouse", "dev")
+            if not os.path.isfile(mouse_dev):
+                continue
+            with open(mouse_dev, "r", encoding="utf-8") as f:
+                major_minor = f.read().strip()
+            major, minor = major_minor.split(":", 1)
+            for hidg in os.listdir("/dev"):
+                if not hidg.startswith("hidg"):
+                    continue
+                hidg_path = os.path.join("/dev", hidg)
+                try:
+                    st = os.stat(hidg_path)
+                except OSError:
+                    continue
+                if (os.major(st.st_rdev) == int(major) and
+                        os.minor(st.st_rdev) == int(minor)):
+                    log.info(f"Auto-detected mouse HID: {hidg_path}")
+                    return hidg_path
+    except Exception as e:
+        log.debug(f"Mouse HID auto-detect failed: {e}")
+    return "/dev/hidg1"
+
+
 # ============================================================
 # HID 键码映射
 # ============================================================
@@ -248,11 +284,11 @@ class KeyboardController:
 class MouseController:
     """USB HID 鼠标控制器 (相对位移模式)。"""
 
-    def __init__(self, device_path: str = "/dev/hidg1",
+    def __init__(self, device_path: str = None,
                  sensitivity: float = 1.0,
                  screen_width: int = 1920,
                  screen_height: int = 1080):
-        self.device_path = device_path
+        self.device_path = device_path or find_mouse_hid()
         self.sensitivity = sensitivity
         self.screen_width = screen_width
         self.screen_height = screen_height
@@ -262,11 +298,17 @@ class MouseController:
         self._current_y = screen_height // 2
 
     def open(self) -> bool:
-        """打开鼠标设备。"""
+        """打开鼠标设备。若配置的路径不存在，自动探测。"""
         if not os.path.exists(self.device_path):
-            log.error(f"Mouse device not found: {self.device_path}")
-            log.error("Run: sudo bash setup_gadget.sh start")
-            return False
+            detected = find_mouse_hid()
+            if detected != self.device_path and os.path.exists(detected):
+                log.info(f"Configured {self.device_path} not found, "
+                         f"using auto-detected {detected}")
+                self.device_path = detected
+            else:
+                log.error(f"Mouse device not found: {self.device_path}")
+                log.error("Run: sudo bash setup_gadget.sh rockchip-mouse")
+                return False
 
         self._fd = open(self.device_path, "wb")
         self._report_length = self._detect_report_length()
@@ -495,12 +537,31 @@ class GameController:
         self.click_delay = ctrl_cfg.get("click_delay", 100) / 1000.0
         self.keymap = ctrl_cfg.get("keymap", {})
 
+        # 鼠标瞄准参数
+        aim_cfg = ctrl_cfg.get("aim", {})
+        self.aim_move_steps = aim_cfg.get("move_steps", 20)
+        self.aim_step_delay = aim_cfg.get("step_delay", 2) / 1000.0
+        self.aim_settle_delay = aim_cfg.get("settle_delay", 80) / 1000.0
+
+        # 坐标校准
+        calib = ctrl_cfg.get("calibration", {})
+        self.calib_offset_x = calib.get("offset_x", 0)
+        self.calib_offset_y = calib.get("offset_y", 0)
+        self.calib_scale_x = calib.get("scale_x", 1.0)
+        self.calib_scale_y = calib.get("scale_y", 1.0)
+
     def open(self) -> bool:
-        """打开键鼠设备。"""
+        """打开键鼠设备。先检查 UDC 是否已连接。"""
+        if not hid_transport_ready():
+            log.error("UDC not configured — run: sudo bash setup_gadget.sh rockchip-mouse")
+            log.error("Then connect USB OTG cable to PC and wait for enumeration.")
+            return False
+
         kbd_ok = self.kbd.open()
         mouse_ok = self.mouse.open()
         if not kbd_ok:
             log.warning("Keyboard unavailable; mouse-only control enabled")
+        log.info(f"Mouse device: {self.mouse.device_path}")
         return mouse_ok
 
     def close(self):
@@ -511,23 +572,39 @@ class GameController:
     # 游戏操作
     # ----------------------------------------------------------
 
-    def throw_ball(self, hold_time: Optional[float] = None):
-        """
-        丢球 — 长按 R 键蓄力，松开释放。
+    # ----------------------------------------------------------
+    # 鼠标瞄准 & 丢球（只用鼠标，不走键盘）
+    # ----------------------------------------------------------
 
-        游戏会自动瞄准角色面前最近的精灵，无需鼠标指向目标。
+    def capture_to_game_coord(self, cap_x: int, cap_y: int) -> Tuple[int, int]:
+        """采集画面坐标 → 校准后的游戏屏幕坐标。"""
+        gx = int((cap_x - self.calib_offset_x) * self.calib_scale_x)
+        gy = int((cap_y - self.calib_offset_y) * self.calib_scale_y)
+        return (
+            max(0, min(self.mouse.screen_width - 1, gx)),
+            max(0, min(self.mouse.screen_height - 1, gy)),
+        )
 
-        Args:
-            hold_time: 蓄力时间 (秒)，None 使用默认配置
-        """
-        if hold_time is None:
-            hold_time = self.throw_hold_time
+    def aim_at_target(self, target_x: int, target_y: int):
+        """平滑移动鼠标光标到精灵位置（采集坐标），自动校准。"""
+        gx, gy = self.capture_to_game_coord(target_x, target_y)
+        log.info(f"Aim: moving cursor to ({gx}, {gy})")
+        self.mouse.move_to(gx, gy,
+                           steps=self.aim_move_steps,
+                           step_delay=self.aim_step_delay)
+        if self.aim_settle_delay > 0:
+            time.sleep(self.aim_settle_delay)
 
-        throw_key = self.keymap.get("throw_ball", "r")
-        log.info(f"Throwing ball (hold {throw_key} for "
-                 f"{hold_time * 1000:.0f}ms)")
+    def start_aim(self, target_x: int, target_y: int):
+        """按住左键开始瞄准：移动到目标 + 按下左键不松开。"""
+        self.aim_at_target(target_x, target_y)
+        log.info(f"Aim: holding LEFT button at ({target_x}, {target_y})")
+        self.mouse.hold("left")
 
-        self.kbd.hold_for(throw_key, duration=hold_time)
+    def release_throw(self):
+        """松开左键 = 丢球！"""
+        log.info("Throw: releasing LEFT button!")
+        self.mouse.release_button()
 
     def interact(self):
         """按交互键 (如 W 键与 NPC 对话)。"""

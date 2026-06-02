@@ -44,9 +44,22 @@ tracker:
 
 # ---- 键鼠控制 ----
 controller:
-  mouse_sensitivity: 1.0          # 鼠标移动灵敏度 (仅辅助操作)
-  throw_hold_time: 500            # R 键长按蓄力时间 (ms)
+  mouse_sensitivity: 1.0          # 鼠标移动灵敏度
+  throw_hold_time: 500            # 长按时间 (ms)
   click_delay: 100                # 点击间隔 (ms)
+
+  # 鼠标瞄准 + 丢球（只支持鼠标，不用键盘）
+  aim:
+    move_steps: 20                # 平滑移动步数
+    step_delay: 2                 # 每步间隔 (ms)
+    settle_delay: 80              # 到达后稳定 (ms)
+
+  # 采集画面 → 游戏画面坐标校准
+  calibration:
+    offset_x: 0                   # X 偏移 (pixels)
+    offset_y: 0                   # Y 偏移 (pixels)
+    scale_x: 1.0                  # 水平缩放
+    scale_y: 1.0                  # 垂直缩放
 
   # HID 设备路径 (由 setup_gadget.sh 创建)
   keyboard_device: /dev/hidg0
