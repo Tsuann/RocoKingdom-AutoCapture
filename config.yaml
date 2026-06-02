@@ -1,0 +1,86 @@
+# ============================================================
+# 洛克王国：世界 — 自动捕捉精灵系统 配置文件
+# ============================================================
+
+# ---- HDMI 画面采集 ----
+capture:
+  device: 0                       # /dev/video0
+  width: 1920
+  height: 1080
+  fps: 30                         # 处理帧率限制
+
+# ---- 精灵检测 ----
+detector:
+  # RKNN 模型 (NPU 加速, 优先)
+  rknn_model: models/sprite_detector.rknn
+  # ONNX 模型 (CPU fallback)
+  onnx_model: models/sprite_detector.onnx
+  # 检测参数
+  input_size: [640, 640]          # YOLO 输入尺寸
+  conf_threshold: 0.5             # 置信度阈值
+  nms_threshold: 0.4              # NMS IoU 阈值
+  # 类别名称 (按模型输出顺序)
+  classes:
+    - normal                      # 普通精灵
+    - shiny                       # 异色精灵
+    - corrupted                   # 污染精灵
+
+  # 模板匹配 (UI 检测)
+  # 验证精灵捕捉结果会用到以下模板 (放入 templates/ 目录):
+  #   capture_success.png  — "捕捉成功"弹窗
+  #   capture_fail.png     — "捕捉失败"弹窗
+  #   battle_end.png       — 战斗结束提示
+  #   battle_ui.png        — 战斗界面特征 (技能栏等)
+  template:
+    match_threshold: 0.7          # 模板匹配阈值
+    templates_dir: templates/
+
+# ---- 目标追踪 ----
+tracker:
+  max_disappeared: 30             # 丢失多少帧后移除追踪器
+  kalman:
+    process_noise: 0.03           # 过程噪声
+    measurement_noise: 0.1        # 测量噪声
+
+# ---- 键鼠控制 ----
+controller:
+  mouse_sensitivity: 1.0          # 鼠标移动灵敏度 (仅辅助操作)
+  throw_hold_time: 500            # R 键长按蓄力时间 (ms)
+  click_delay: 100                # 点击间隔 (ms)
+
+  # HID 设备路径 (由 setup_gadget.sh 创建)
+  keyboard_device: /dev/hidg0
+  mouse_device: /dev/hidg1
+
+  # 键盘按键映射 (使用 controller.py 中的按键名称)
+  keymap:
+    interact: w                   # W 键 - 交互
+    throw_ball: r                 # R 键 - 丢球
+    run: shift                    # Shift - 奔跑
+    skill1: "1"                   # 1 键 - 技能1
+    skill2: "2"                   # 2 键 - 技能2
+    escape: esc                   # ESC
+    confirm: enter                # Enter
+    focus: x                      # X 键 - 聚能
+
+# ---- 自动化状态机 ----
+automation:
+  scan_interval: 0.5              # 扫描间隔 (秒)
+  max_throw_attempts: 3           # 最大丢球次数
+  verify_wait: 3.0                # 丢球后等待结果 (秒)
+  target_priority:                # 目标优先级
+    - shiny                        # 优先异色
+    - corrupted                    # 其次污染
+    - normal                       # 最后普通
+
+# ---- 热键 (通过键盘监听) ----
+hotkeys:
+  start: f2                       # 启动自动捕捉
+  pause: f3                       # 暂停/恢复
+  exit: f4                        # 退出程序
+
+# ---- 日志 ----
+logging:
+  level: INFO                     # DEBUG, INFO, WARNING, ERROR
+  log_dir: logs/
+  save_screenshots: false          # 是否保存检测截图

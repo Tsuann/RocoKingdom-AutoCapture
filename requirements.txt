@@ -1,0 +1,17 @@
+# 洛克王国：世界 — 自动捕捉精灵系统 依赖
+
+# 核心 (已预装在系统中)
+# opencv-python>=4.8
+# numpy>=1.24
+# PyYAML>=5.4
+
+# RKNN (NPU 加速, 已安装)
+# rknn-toolkit-lite2>=2.0
+
+# ONNX Runtime (CPU fallback, 已安装)
+# onnxruntime>=1.15
+
+# 以下可选安装:
+# PyTorch + Ultralytics (用于模型训练/转换, 已安装)
+# torch>=2.0
+# ultralytics>=8.0  # 如果需要自行训练 YOLO 模型

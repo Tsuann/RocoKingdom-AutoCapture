@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Models (large binary files)
+models/*.rknn
+models/*.onnx
+models/*.pt
+
+# Training outputs
+runs/
+dataset/
+
+# Templates (user data)
+templates/*.png
+
+# Logs
+logs/*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

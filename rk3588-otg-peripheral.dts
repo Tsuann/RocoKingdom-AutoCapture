@@ -1,0 +1,37 @@
+// Device Tree Overlay: 将 USB 3.0 OTG 口强制切换为 Peripheral (设备) 模式
+//
+// 适用范围: Orange Pi 5 Ultra (rk3588)
+// 修改目标: USB 3.0 蓝色口 B (fc000000.usb, usbdrd3_0)
+//
+// 原因: Orange Pi 5 Ultra 没有 Type-C CC 控制器驱动,
+//       dr_mode=otg 无法自动检测角色, DWC3 默认工作在 host 模式。
+//       此 overlay 强制切换到 peripheral 模式, 使该 USB 口作为
+//       USB 设备连接 PC (模拟键鼠)。
+//
+//       /delete-property/ extcon 完全移除 extcon 引用（而非设为无效 phandle 0），
+//       因为该板没有 CC 控制器。设为 <0> 会导致 DWC3 驱动在尝试获取 extcon
+//       时进入异常状态，所有连接机制（含 soft_connect）被锁死。
+//       彻底删除后，peripheral 模式下 DWC3 会自动上拉 D+ 线。
+//
+// 影响: 仅影响 USB 3.0 口 B, 其余 3 个 USB-A 口保持不变。
+//       键盘、鼠标等外设仍可正常使用。
+//
+// 用法:
+//   1. 编译: dtc -I dts -O dtb -o rk3588-otg-peripheral.dtbo rk3588-otg-peripheral.dts
+//   2. 安装: sudo cp rk3588-otg-peripheral.dtbo /boot/dtb/rockchip/overlay/
+//   3. 配置: echo 'overlays=otg-peripheral' | sudo tee -a /boot/orangepiEnv.txt
+//   4. 重启: sudo reboot
+//   5. 验证: ls /sys/class/udc/  # 应显示 fc000000.usb
+
+/dts-v1/;
+/plugin/;
+
+/ {
+    fragment@0 {
+        target-path = "/usbdrd3_0/usb@fc000000";
+        __overlay__ {
+            dr_mode = "peripheral";
+            /delete-property/ extcon;
+        };
+    };
+};
