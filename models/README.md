@@ -2,86 +2,60 @@
 
 此目录存放精灵检测模型文件。
 
+## 当前模型状态
+
+| 模型文件 | 状态 | 说明 |
+|---------|------|------|
+| `sprite_detector.pt` | ✅ V4 | PyTorch 权重，小独角兽 (mAP50=0.994)，6.2MB |
+| `sprite_detector.onnx` | ✅ V4 | ONNX 模型，部署用，11.7MB |
+| `sprite_detector.rknn` | ❌ 待转换 | 需在 x86 PC 用 RKNN Toolkit 转换 |
+
+### 已训练类别
+
+| ID | 精灵 | 数据 | 夜间 | 白天 |
+|----|------|------|------|------|
+| 6 | 小独角兽 | 2段视频 + 10张夜间 + 9张白天 | 10/10 | 9/10 |
+
+### 待采集
+
+| ID | 精灵 | 状态 |
+|----|------|------|
+| 0 | 护主犬 | 待录像 |
+| 1 | 伊贝儿 | 待录像 |
+| 2 | 恶魔叮 | 待录像 |
+| 3 | 菊花梨 | 待录像 |
+| 4 | 公平鸽 | 待录像 |
+| 5 | 灵狐 | 待录像 |
+| 7 | 小夜/朔夜伊芙 | 待录像 |
+
 ## 模型类型
 
-### RKNN 模型 (推荐, NPU 加速)
+### ONNX 模型 (开发板部署)
+- 文件名: `sprite_detector.onnx`
+- 推理速度: ~100-300ms (Orange Pi CPU) / ~1ms (PC GPU)
+- 格式: 通用 ONNX (opset 12, simplified)
+
+### RKNN 模型 (NPU 加速, 待转换)
 - 文件名: `sprite_detector.rknn`
 - 推理速度: ~10-30ms (NPU)
-- 格式: Rockchip NPU 专用
+- 需用 RKNN Toolkit 从 ONNX 转换
 
-### ONNX 模型 (CPU 备选)
-- 文件名: `sprite_detector.onnx`
-- 推理速度: ~100-300ms (CPU)
-- 格式: 通用 ONNX
-
-## 如何获取模型
-
-### 方法 1: 自行训练 (当前推荐)
-
-社区模型仓库 `RocoKingdom_AutoCapture` 尚未发布预训练权重（GitHub Releases 为空）。
-因此当前推荐的方案是**自行采集数据并训练**。
-
-完整流程:
+## PC 训练流程
 
 ```bash
-# Step 1: 采集游戏截图
-# 启动采集工具，在游戏中按 SPACE 保存包含精灵的截图
-python3 scripts/capture_screenshots.py
+# 1. 录视频 — OBS 框选精灵区域，2-5 分钟多角度旋转
+# 2. 提取帧
+python scripts/extract_frames.py dataset/video/xxx.mp4 --sprite xiao_dujiaoshou --fps 2
+# 3. 自动标注
+python scripts/auto_label.py dataset/raw_xiao_dujiaoshou/ --class-id 6
+# 4. 训练 (RTX 5060 Ti ~10分钟)
+python scripts/incremental_train.py --new-data dataset/labeled_xiao_dujiaoshou/ --device cuda
+# 5. ONNX 自动导出到 models/sprite_detector.onnx
 
-# Step 2: 标注精灵位置
-# 打开截图，用鼠标拖拽画出精灵的边界框
-python3 scripts/label_tool.py dataset/raw/
-
-# Step 3: 训练模型并导出 ONNX
-# # 在 Orange Pi 上（CPU 训练，较慢但已安装依赖）:
-python3 scripts/train_model.py --data dataset/labeled/ --epochs 100 --device cpu
-
-# 或在带 GPU 的 PC 上训练（推荐，速度快 50-100 倍）:
-# 将 dataset/labeled/ 复制到 PC，然后:
-# python3 scripts/train_model.py --data dataset/labeled/ --epochs 100 --device cuda
+# 部署到开发板
+scp models/sprite_detector.onnx orangepi@<ip>:/home/orangepi/Desktop/rock/models/
 ```
 
-训练完成后，`models/sprite_detector.onnx` 会自动生成。
+## 无模型运行
 
-**数据量建议**: 至少 50-100 张不同场景的截图，每张包含 1-5 个精灵。
-
-### 方法 2: 使用社区预训练模型 (待更新)
-
-从 RocoKingdom_AutoCapture 项目获取:
-```
-https://github.com/ace-trump-tech/RocoKingdom_AutoCapture
-```
-
-> ⚠️ 截至 2026-06-02，该项目尚未在 Releases 中发布模型权重文件。
-> 关注该仓库的更新，或联系作者"源批之星·鲁健"获取。
->
-> 如果获取到 `s2_all_sprites.pt`，可以用以下命令直接导出 ONNX:
-> ```bash
-> python3 scripts/train_model.py --export-only --weights s2_all_sprites.pt
-> ```
-
-### 方法 3: 无模型运行
-
-即使没有 YOLO 模型，系统也会使用运动检测 + 模板匹配作为后备方案。
-准确率较低但可以验证整个流程。
-
-## 模型转换 (PyTorch → RKNN)
-
-需要在 **x86 PC** 上使用 RKNN Toolkit 完整版进行转换:
-
-```bash
-# 1. PyTorch → ONNX (可在任意环境完成)
-python3 scripts/train_model.py --export-only --weights models/sprite_detector.pt
-
-# 2. ONNX → RKNN (必须在 x86 PC 上运行 RKNN Toolkit)
-python3 convert_to_rknn.py
-```
-
-转换完成后将 `.rknn` 文件拷贝到此目录。
-
-> 注意: RKNN Toolkit 完整版 (非 lite) 仅支持 x86 Ubuntu/Windows，不能在 ARM 开发板上直接运行。
-
-## 当前状态
-
-如果此目录下没有 `.rknn` 或 `.onnx` 文件，系统会自动使用**运动检测**模式。
-虽然精度不如 YOLO，但可以用于测试基本流程。
+如果 `models/` 下没有 `.onnx` 文件，系统自动使用运动检测作为后备方案。

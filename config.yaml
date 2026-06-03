@@ -19,11 +19,18 @@ detector:
   input_size: [640, 640]          # YOLO 输入尺寸
   conf_threshold: 0.5             # 置信度阈值
   nms_threshold: 0.4              # NMS IoU 阈值
-  # 类别名称 (按模型输出顺序)
+
+  # 类别名称 — S2赛季可出异色的8只常驻精灵 (物种级识别)
+  # 模型只识别普通精灵外形 (异色版本只是颜色不同，外形不变)
   classes:
-    - normal                      # 普通精灵
-    - shiny                       # 异色精灵
-    - corrupted                   # 污染精灵
+    - huzhu_quan         # 0: 护主犬 (音速犬)
+    - yibei_er           # 1: 伊贝儿
+    - emo_ding           # 2: 恶魔叮
+    - juhua_li           # 3: 菊花梨
+    - gongping_ge        # 4: 公平鸽
+    - ling_hu            # 5: 灵狐
+    - xiao_dujiaoshou    # 6: 小独角兽
+    - xiaoye_yifu        # 7: 小夜/朔夜伊芙
 
   # 模板匹配 (UI 检测)
   # 验证精灵捕捉结果会用到以下模板 (放入 templates/ 目录):
@@ -48,11 +55,29 @@ controller:
   throw_hold_time: 500            # 长按时间 (ms)
   click_delay: 100                # 点击间隔 (ms)
 
+  # 人类行为模拟 (避免系统检测到脚本化的直来直去操作)
+  humanize: true                  # 是否启用人类行为模拟
+  humanize_config:
+    jitter_amplitude: 3           # 轨迹噪声幅度 (像素)
+    overshoot_probability: 0.15   # 过冲概率 (模拟手抖越过目标)
+    overshoot_amount: 0.08        # 过冲比例
+    speed_variation: 0.3          # 移动速度变化幅度
+
   # 鼠标瞄准 + 丢球（只支持鼠标，不用键盘）
   aim:
     move_steps: 20                # 平滑移动步数
     step_delay: 2                 # 每步间隔 (ms)
     settle_delay: 80              # 到达后稳定 (ms)
+    # 丢球模式: "hold_aim" = 长按瞄准→松开丢球(推荐, 更准)
+    #           "click"     = 传统点击丢球
+    default_mode: hold_aim
+
+  # 视角旋转 (视野内无精灵时自动旋转视角搜索)
+  pan:
+    amount: 200                   # 单次旋转像素量
+    default_direction: right      # 默认旋转方向
+    alternate: true               # 是否左右交替旋转
+    scan_width: 600               # 全景扫描宽度
 
   # 采集画面 → 游戏画面坐标校准
   calibration:
@@ -68,7 +93,7 @@ controller:
   # 键盘按键映射 (使用 controller.py 中的按键名称)
   keymap:
     interact: w                   # W 键 - 交互
-    throw_ball: r                 # R 键 - 丢球
+    throw_ball: r                 # R 键 - 丢球 (备用，目前用鼠标)
     run: shift                    # Shift - 奔跑
     skill1: "1"                   # 1 键 - 技能1
     skill2: "2"                   # 2 键 - 技能2
@@ -81,10 +106,21 @@ automation:
   scan_interval: 0.5              # 扫描间隔 (秒)
   max_throw_attempts: 3           # 最大丢球次数
   verify_wait: 3.0                # 丢球后等待结果 (秒)
-  target_priority:                # 目标优先级
-    - shiny                        # 优先异色
-    - corrupted                    # 其次污染
-    - normal                       # 最后普通
+  target_priority:                # 目标优先级 (按物种类别)
+    - huzhu_quan
+    - yibei_er
+    - emo_ding
+    - juhua_li
+    - gongping_ge
+    - ling_hu
+    - xiao_dujiaoshou
+    - xiaoye_yifu
+
+  # 视角自动旋转 (视野内无精灵时)
+  pan:
+    enabled: true                 # 是否启用自动旋转视角
+    empty_scans_before_pan: 5     # 连续多少次空扫描后旋转视角
+    scan_width: 600               # 全景扫描宽度 (像素)
 
 # ---- 热键 (通过键盘监听) ----
 hotkeys:

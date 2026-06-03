@@ -22,8 +22,17 @@ from utils import log
 # 常量
 # ============================================================
 
-# COCO 风格类别 (如果使用通用 YOLO 模型，需替换为精灵类别)
-DEFAULT_CLASSES = ["normal", "shiny", "corrupted"]
+# S2赛季精灵物种类别 (物种级识别: 8只可出异色的常驻精灵)
+DEFAULT_CLASSES = [
+    "huzhu_quan",         # 0: 护主犬 (音速犬)
+    "yibei_er",           # 1: 伊贝儿
+    "emo_ding",           # 2: 恶魔叮
+    "juhua_li",           # 3: 菊花梨
+    "gongping_ge",        # 4: 公平鸽
+    "ling_hu",            # 5: 灵狐
+    "xiao_dujiaoshou",    # 6: 小独角兽
+    "xiaoye_yifu",        # 7: 小夜/朔夜伊芙
+]
 
 # 模板匹配默认模板名
 UI_TEMPLATES = {
@@ -84,7 +93,7 @@ def yolo_postprocess(output: np.ndarray,
                       frame_shape: Tuple[int, int],
                       conf_threshold: float = 0.5,
                       nms_threshold: float = 0.4,
-                      num_classes: int = 3) -> List[dict]:
+                      num_classes: int = 8) -> List[dict]:
     """
     YOLO 输出后处理。
 
@@ -278,11 +287,13 @@ class RKNNDetector:
     """使用 RKNN Runtime (NPU) 进行 YOLO 推理。"""
 
     def __init__(self, model_path: str, input_size: Tuple[int, int] = (640, 640),
-                 conf_threshold: float = 0.5, nms_threshold: float = 0.4):
+                 conf_threshold: float = 0.5, nms_threshold: float = 0.4,
+                 num_classes: int = 8):
         self.model_path = model_path
         self.input_size = input_size
         self.conf_threshold = conf_threshold
         self.nms_threshold = nms_threshold
+        self.num_classes = num_classes
         self._rknn = None
 
     def load(self) -> bool:
@@ -349,6 +360,7 @@ class RKNNDetector:
             frame_shape=frame.shape,
             conf_threshold=self.conf_threshold,
             nms_threshold=self.nms_threshold,
+            num_classes=self.num_classes,
         )
 
     def _preprocess(self, frame: np.ndarray,
@@ -391,11 +403,13 @@ class ONNXDetector:
     """使用 ONNX Runtime (CPU) 进行 YOLO 推理。"""
 
     def __init__(self, model_path: str, input_size: Tuple[int, int] = (640, 640),
-                 conf_threshold: float = 0.5, nms_threshold: float = 0.4):
+                 conf_threshold: float = 0.5, nms_threshold: float = 0.4,
+                 num_classes: int = 8):
         self.model_path = model_path
         self.input_size = input_size
         self.conf_threshold = conf_threshold
         self.nms_threshold = nms_threshold
+        self.num_classes = num_classes
         self._session = None
         self._input_name = None
         self._output_names = None
@@ -462,6 +476,7 @@ class ONNXDetector:
             frame_shape=frame.shape,
             conf_threshold=self.conf_threshold,
             nms_threshold=self.nms_threshold,
+            num_classes=self.num_classes,
         )
 
     def _preprocess(self, frame: np.ndarray,
@@ -586,6 +601,10 @@ class SpriteDetector:
         """
         self.config = config
 
+        # 类别配置
+        self.classes = config.get("classes", DEFAULT_CLASSES)
+        self.num_classes = len(self.classes)
+
         # YOLO (RKNN)
         self._rknn: Optional[RKNNDetector] = None
         rknn_path = config.get("rknn_model", "")
@@ -595,6 +614,7 @@ class SpriteDetector:
                 input_size=tuple(config.get("input_size", [640, 640])),
                 conf_threshold=config.get("conf_threshold", 0.5),
                 nms_threshold=config.get("nms_threshold", 0.4),
+                num_classes=self.num_classes,
             )
             log.info(f"Attempting to load RKNN model: {rknn_path}")
             if not self._rknn.load():
@@ -611,6 +631,7 @@ class SpriteDetector:
                     input_size=tuple(config.get("input_size", [640, 640])),
                     conf_threshold=config.get("conf_threshold", 0.5),
                     nms_threshold=config.get("nms_threshold", 0.4),
+                    num_classes=self.num_classes,
                 )
                 if not self._onnx.load():
                     log.warning("ONNX load failed, will use motion detection")

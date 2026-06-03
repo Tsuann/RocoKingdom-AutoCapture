@@ -12,6 +12,7 @@ HID 报告格式:
 
 import math
 import os
+import random
 import struct
 import time
 from typing import Optional, Tuple
@@ -282,7 +283,13 @@ class KeyboardController:
 # ============================================================
 
 class MouseController:
-    """USB HID 鼠标控制器 (相对位移模式)。"""
+    """USB HID 鼠标控制器 (相对位移模式)。
+
+    内置人类行为模拟:
+      - 轨迹噪声: 每次移动加入随机偏移
+      - 速度变化: 模拟加速/减速曲线
+      - 过冲修正: 偶尔越过目标再回正 (模拟手抖)
+    """
 
     def __init__(self, device_path: str = None,
                  sensitivity: float = 1.0,
@@ -296,6 +303,13 @@ class MouseController:
         self._report_length = 4
         self._current_x = screen_width // 2
         self._current_y = screen_height // 2
+
+        # 人类行为模拟参数
+        self.humanize_enabled = True
+        self.jitter_amplitude = 3       # 轨迹噪声幅度 (像素)
+        self.overshoot_probability = 0.15  # 过冲概率
+        self.overshoot_amount = 0.08    # 过冲比例 (相对总位移)
+        self.speed_variation = 0.3      # 速度变化幅度
 
     def open(self) -> bool:
         """打开鼠标设备。若配置的路径不存在，自动探测。"""
@@ -350,7 +364,7 @@ class MouseController:
                 steps: int = 20, step_delay: float = 0.002):
         """
         将鼠标移动到屏幕的绝对坐标位置。
-        使用多步平滑移动。
+        使用多步平滑移动 + 人类行为模拟 (随机偏移、速度变化、过冲)。
 
         Args:
             target_x, target_y: 目标坐标 (像素, 相对游戏画面左上角)
@@ -367,23 +381,147 @@ class MouseController:
         if abs(dx_total) < 2 and abs(dy_total) < 2:
             return  # 已经在目标位置
 
-        for i in range(1, steps + 1):
-            # 使用 ease-in-out 曲线
-            t = i / steps
-            ease = t * t * (3 - 2 * t)  # smoothstep
+        # 人类行为模拟: 偶尔过冲再回正
+        overshoot_x, overshoot_y = 0, 0
+        if self.humanize_enabled and random.random() < self.overshoot_probability:
+            overshoot_x = int(dx_total * self.overshoot_amount * random.uniform(0.5, 1.5))
+            overshoot_y = int(dy_total * self.overshoot_amount * random.uniform(0.5, 1.5))
 
-            interp_x = start_x + int(dx_total * ease)
-            interp_y = start_y + int(dy_total * ease)
+        # 分两阶段: 主体移动 (含过冲) + 回正微调
+        phases = [(dx_total + overshoot_x, dy_total + overshoot_y,
+                   max(steps - 3, 2))]
+        if overshoot_x != 0 or overshoot_y != 0:
+            phases.append((-overshoot_x, -overshoot_y, 3))  # 回正微调
 
-            # 计算这一步的相对位移
-            step_dx = interp_x - self._current_x
-            step_dy = interp_y - self._current_y
+        prev_x, prev_y = start_x, start_y
 
-            if step_dx != 0 or step_dy != 0:
-                self.move(step_dx, step_dy)
+        for phase_dx, phase_dy, phase_steps in phases:
+            for i in range(1, phase_steps + 1):
+                t = i / phase_steps
 
-            if step_delay > 0:
-                time.sleep(step_delay)
+                # 使用变化的速度曲线 (非均匀 ease)
+                if self.humanize_enabled:
+                    ease = self._human_ease(t)
+                else:
+                    ease = t * t * (3 - 2 * t)  # standard smoothstep
+
+                interp_x = prev_x + int(phase_dx * ease)
+                interp_y = prev_y + int(phase_dy * ease)
+
+                # 人类行为模拟: 轨迹噪声 (偏移当前位置)
+                if self.humanize_enabled:
+                    jitter_x = random.randint(-self.jitter_amplitude,
+                                              self.jitter_amplitude)
+                    jitter_y = random.randint(-self.jitter_amplitude,
+                                              self.jitter_amplitude)
+                    interp_x += jitter_x
+                    interp_y += jitter_y
+
+                step_dx = interp_x - self._current_x
+                step_dy = interp_y - self._current_y
+
+                if step_dx != 0 or step_dy != 0:
+                    self.move(step_dx, step_dy)
+
+                # 可变步长延迟 (模拟速度变化)
+                if step_delay > 0:
+                    actual_delay = step_delay
+                    if self.humanize_enabled:
+                        actual_delay *= random.uniform(
+                            1 - self.speed_variation,
+                            1 + self.speed_variation
+                        )
+                    time.sleep(max(0.0005, actual_delay))
+
+            prev_x = self._current_x
+            prev_y = self._current_y
+
+    def _human_ease(self, t: float) -> float:
+        """生成非均匀的缓动曲线，模拟人类手部运动。"""
+        # 随机选择曲线类型
+        curve_type = hash(str(t)) % 3  # 伪随机但确定性的选择
+        if curve_type == 0:
+            # 先快后慢 (decay)
+            return 1 - math.pow(1 - t, 2.5)
+        elif curve_type == 1:
+            # S 型加速
+            return t * t * (3 - 2 * t)
+        else:
+            # 先慢后快再慢
+            return 0.5 * (math.sin((t - 0.5) * math.pi) + 1)
+
+    # ----------------------------------------------------------
+    # 视角旋转 (当视野内无精灵时)
+    # ----------------------------------------------------------
+
+    def pan_view(self, direction: str = "right",
+                 amount: int = 200,
+                 duration: float = 0.3):
+        """
+        旋转视角 (移动鼠标左右来旋转游戏镜头)。
+
+        在游戏中按住鼠标左键并左右拖动可以旋转视角。
+        这里通过相对移动鼠标来实现。
+
+        Args:
+            direction: "left" 或 "right"
+            amount: 移动量 (屏幕像素)
+            duration: 持续时间 (秒)
+        """
+        sign = 1 if direction == "right" else -1
+        dx = sign * amount
+        # 分多步平滑旋转
+        steps = max(5, int(duration / 0.01))
+        dx_per_step = dx // steps
+        remainder = dx - dx_per_step * steps
+
+        for i in range(steps):
+            step = dx_per_step + (1 if i < abs(remainder) else 0)
+            if step != 0:
+                self.move(step, 0)
+            time.sleep(duration / steps)
+
+    def pan_view_humanized(self, direction: str = "right",
+                           amount: int = 200,
+                           min_steps: int = 8,
+                           max_steps: int = 20):
+        """
+        带人类行为模拟的视角旋转。
+        速度不均匀、有停顿、偶尔反向微调。
+
+        Args:
+            direction: "left" 或 "right"
+            amount: 总移动量 (像素)
+            min_steps, max_steps: 随机步数范围
+        """
+        sign = 1 if direction == "right" else -1
+        steps = random.randint(min_steps, max_steps)
+        remaining = sign * amount
+
+        for i in range(steps):
+            # 不均匀分布: 前几步移动多，后几步移动少
+            progress = i / steps
+            fraction = 1.0 - progress * 0.7  # 递减
+            step_dx = int(remaining * fraction / (steps - i))
+
+            # 随机 Y 偏移 (模拟手抖)
+            if self.humanize_enabled:
+                jitter_y = random.randint(-2, 2)
+            else:
+                jitter_y = 0
+
+            if step_dx != 0 or jitter_y != 0:
+                self.move(step_dx, jitter_y)
+            remaining -= step_dx
+
+            # 随机停顿
+            delay = random.uniform(0.008, 0.025)
+            time.sleep(delay)
+
+            # 偶尔反向微调
+            if self.humanize_enabled and random.random() < 0.15:
+                self.move(-random.randint(1, 5), random.randint(-2, 2))
+                time.sleep(random.uniform(0.005, 0.015))
 
     def click(self, button: str = "left", duration: float = 0.05):
         """点击鼠标按键。"""
@@ -550,6 +688,21 @@ class GameController:
         self.calib_scale_x = calib.get("scale_x", 1.0)
         self.calib_scale_y = calib.get("scale_y", 1.0)
 
+        # 人类行为模拟开关
+        self.humanize_enabled = ctrl_cfg.get("humanize", True)
+
+        # 视角旋转参数
+        pan_cfg = ctrl_cfg.get("pan", {})
+        self.pan_amount = pan_cfg.get("amount", 200)
+        self.pan_direction = pan_cfg.get("default_direction", "right")
+        self.pan_alternate = pan_cfg.get("alternate", True)  # 左右交替
+        self._pan_last_direction = "right"
+
+        # 默认瞄准模式: 先长按进入瞄准，再松开丢球
+        self.default_aim_mode = aim_cfg.get("default_mode", "hold_aim")
+        # "hold_aim" = 长按瞄准 → 松开丢球 (默认)
+        # "click" = 传统点击丢球
+
     def open(self) -> bool:
         """打开键鼠设备。先检查 UDC 是否已连接。"""
         if not hid_transport_ready():
@@ -605,6 +758,120 @@ class GameController:
         """松开左键 = 丢球！"""
         log.info("Throw: releasing LEFT button!")
         self.mouse.release_button()
+
+    def throw_ball_hold_mode(self, target_x: int, target_y: int,
+                             hold_time: float = None):
+        """
+        默认丢球模式: 长按瞄准 → 定位 → 松开丢球。
+
+        这是推荐的捕捉方式:
+        1. 移动光标到精灵附近
+        2. 按住左键进入瞄准状态
+        3. 微调位置 (由游戏自动吸附)
+        4. 松开左键丢球
+
+        Args:
+            target_x, target_y: 精灵在采集画面中的坐标
+            hold_time: 长按时间 (秒), None 使用配置值
+        """
+        if hold_time is None:
+            hold_time = self.throw_hold_time
+
+        gx, gy = self.capture_to_game_coord(target_x, target_y)
+        log.info(f"Throw(hold): moving to ({gx},{gy}) → hold {hold_time:.2f}s → release")
+        self.mouse.aim_and_hold(
+            target_x=gx, target_y=gy,
+            hold_duration=hold_time,
+            move_steps=self.aim_move_steps,
+        )
+
+    def throw_ball_click_mode(self, target_x: int, target_y: int):
+        """
+        备选丢球模式: 点击丢球 (短按)。
+
+        Args:
+            target_x, target_y: 精灵在采集画面中的坐标
+        """
+        gx, gy = self.capture_to_game_coord(target_x, target_y)
+        log.info(f"Throw(click): moving to ({gx},{gy}) → click")
+        self.mouse.aim_and_click(
+            target_x=gx, target_y=gy,
+            button="left",
+            move_steps=self.aim_move_steps,
+            click_duration=self.click_delay,
+        )
+
+    def throw_ball(self, target_x: int, target_y: int,
+                   hold_time: float = None):
+        """
+        统一丢球接口。根据 default_aim_mode 选择模式。
+
+        Args:
+            target_x, target_y: 采集画面中的坐标
+            hold_time: 仅 hold_aim 模式使用
+        """
+        if self.default_aim_mode == "hold_aim":
+            self.throw_ball_hold_mode(target_x, target_y, hold_time)
+        else:
+            self.throw_ball_click_mode(target_x, target_y)
+
+    # ----------------------------------------------------------
+    # 视角旋转 (视野内无精灵时)
+    # ----------------------------------------------------------
+
+    def pan_view(self, direction: str = None, amount: int = None):
+        """
+        旋转游戏视角。在视野内找不到精灵时使用。
+
+        策略: 左右交替旋转视角来扩大搜索范围。
+        使用人类化移动模拟手柄/鼠标操作。
+
+        Args:
+            direction: "left" 或 "right", None = 自动交替
+            amount: 旋转像素量, None = 使用配置值
+        """
+        if direction is None:
+            # 自动交替方向
+            direction = self._pan_last_direction
+            if self.pan_alternate:
+                direction = "left" if direction == "right" else "right"
+            self._pan_last_direction = direction
+
+        if amount is None:
+            amount = self.pan_amount
+
+        log.info(f"Pan view: {direction} ({amount}px)")
+        self.mouse.pan_view_humanized(
+            direction=direction,
+            amount=amount,
+        )
+        time.sleep(0.15)  # 等待画面渲染
+
+    def pan_view_scan(self, scan_width: int = None):
+        """
+        全景扫描: 从左到右旋转视角，覆盖更大范围。
+        用于找不到任何精灵时的广域搜索。
+
+        Args:
+            scan_width: 扫描宽度 (像素), None = 使用配置值 * 3
+        """
+        if scan_width is None:
+            scan_width = self.pan_amount * 3
+
+        # 先往右看
+        log.info(f"Pan scan: right {scan_width}px...")
+        self.mouse.pan_view_humanized("right", amount=scan_width)
+        time.sleep(0.2)
+
+        # 再往左看 (回扫)
+        log.info(f"Pan scan: left {scan_width * 2}px...")
+        self.mouse.pan_view_humanized("left", amount=scan_width * 2)
+        time.sleep(0.2)
+
+        # 回到中间
+        log.info(f"Pan scan: back to center")
+        self.mouse.pan_view_humanized("right", amount=scan_width)
+        time.sleep(0.15)
 
     def interact(self):
         """按交互键 (如 W 键与 NPC 对话)。"""

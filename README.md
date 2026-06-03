@@ -31,23 +31,35 @@ Windows PC (游戏) ═══ HDMI ═══> Orange Pi 5 Ultra ═══ USB-C 
 ```
 rock/
 ├── main.py              # 入口脚本，支持 debug / manual / auto 三种模式
-├── config.yaml          # 配置文件（模型路径、检测参数、热键等）
+├── config.yaml          # 配置文件（模型路径、8物种分类、人类化参数等）
 ├── capture.py           # HDMI 画面采集模块（后台线程抓帧）
 ├── detector.py          # 精灵检测模块（RKNN / ONNX / 运动检测 + 模板匹配）
 ├── tracker.py           # 多目标追踪模块（卡尔曼滤波 + IoU 匹配）
-├── controller.py        # 键鼠控制模块（USB HID 键盘/鼠标）
-├── state_machine.py     # 自动化状态机 + 热键监听器
+├── controller.py        # 键鼠控制模块（人类行为模拟 + 视角旋转 + 长按瞄准）
+├── state_machine.py     # 自动化状态机 + 热键监听器 + 视角自动旋转
 ├── hid_gadget.py        # USB HID Gadget 管理模块
 ├── utils.py             # 工具函数（日志、坐标变换、FPS 计数、绘制）
 ├── setup_gadget.sh      # USB HID Gadget 一键配置脚本
-├── rk3588-otg-peripheral.dts  # DT overlay 源码（修复 OTG 口设备模式）
+├── rk3588-otg-peripheral.dts  # DT overlay 源码（参考，已不使用）
 ├── setup_otg_guide.md   # USB OTG 连接指南
 ├── requirements.txt     # Python 依赖说明
-├── scripts/             # 辅助工具（采集、标注、训练）
-│   ├── capture_screenshots.py  # 训练数据截图采集
-│   ├── label_tool.py           # 图像标注工具（画边界框）
-│   └── train_model.py          # YOLOv8 训练 + ONNX 导出
-├── models/              # 模型文件目录（.rknn / .onnx）
+├── scripts/             # 辅助工具
+│   ├── crawl_sprites.py       # 精灵图片爬虫（百度+Bing+DDG多引擎）
+│   ├── extract_frames.py      # 视频帧提取（从录像截帧）
+│   ├── auto_label.py          # 自动标注（运动检测+边缘检测）
+│   ├── capture_dataset.py     # Windows 截图采集工具
+│   ├── label_tool.py          # 图像标注工具（8物种快捷键）
+│   ├── augment_dataset.py     # 数据增强（翻转/颜色/噪声/模糊）
+│   ├── incremental_train.py   # 增量训练管理（按物种分批）
+│   └── train_model.py         # YOLOv8 完整训练 + ONNX 导出
+├── dataset/             # 训练数据（PC端）
+│   ├── raw_*/           # 原始截图/爬虫图片
+│   ├── labeled_*/       # 标注后数据
+│   ├── augmented_*/     # 增强后数据
+│   └── video/           # 游戏录像
+├── models/              # 模型文件
+│   ├── sprite_detector.pt    # PyTorch 权重（PC端验证）
+│   └── sprite_detector.onnx  # ONNX 模型（开发板部署）
 ├── templates/           # UI 模板图片目录（.png）
 └── logs/                # 运行日志
 ```
@@ -111,31 +123,43 @@ pip install -r requirements.txt
 将 YOLO 检测模型放入 `models/` 目录：
 
 ```bash
-# NPU 模型（推荐，~10-30ms 推理）
-cp /path/to/sprite_detector.rknn models/
-
-# 或 ONNX 模型（CPU fallback，~100-300ms）
+# ONNX 模型（CPU 推理，~100-300ms）
 cp /path/to/sprite_detector.onnx models/
 ```
 
-**如何获取模型？**
+**模型训练（PC端）**
 
-社区模型仓库 (`RocoKingdom_AutoCapture`) 暂未发布预训练权重。当前推荐**自行采集数据训练**：
+当前模型基于 **S2赛季8只可出异色的常驻精灵** 训练，采用**物种级识别**：
+
+| 类别 ID | 精灵名称 | 状态 |
+|---------|----------|------|
+| 0 | 护主犬 (音速犬) | 待采集 |
+| 1 | 伊贝儿 | 待采集 |
+| 2 | 恶魔叮 | 待采集 |
+| 3 | 菊花梨 | 待采集 |
+| 4 | 公平鸽 | 待采集 |
+| 5 | 灵狐 | 待采集 |
+| 6 | 小独角兽 | ✅ 已训练 (mAP50=0.995) |
+| 7 | 小夜/朔夜伊芙 | 待采集 |
+
+**PC端训练流程**：
 
 ```bash
-# Step 1: 采集游戏截图（按 SPACE 保存）
-python3 scripts/capture_screenshots.py
+# 1. 录视频 — 用 OBS 框选精灵区域录制 2-5 分钟多角度旋转
+# 2. 提取帧
+python scripts/extract_frames.py dataset/video/xxx.mp4 --sprite xiao_dujiaoshou --fps 2
 
-# Step 2: 标注精灵边界框（鼠标拖拽画框）
-python3 scripts/label_tool.py dataset/raw/
+# 3. 自动标注（运动检测）
+python scripts/auto_label.py dataset/raw_xiao_dujiaoshou/ --class-id 6
 
-# Step 3: 训练 + 导出 ONNX
-python3 scripts/train_model.py --data dataset/labeled/ --epochs 100
+# 4. 检查标注（可选，用于修正自动标注错误）
+python scripts/label_tool.py dataset/labeled_xiao_dujiaoshou/
+
+# 5. 增量训练（5060 Ti 约 10 分钟）
+python scripts/incremental_train.py --new-data dataset/labeled_xiao_dujiaoshou/ --device cuda
 ```
 
-> 详见 [models/README.md](models/README.md)。
-
-如果没有模型文件，系统会自动使用**运动检测**作为后备方案（精度较低，但可验证流程）。
+> 详见 [PC训练指南](#pc训练工作流)。如果没有模型文件，系统会自动使用**运动检测**作为后备方案。
 
 ### 3. 放置 UI 模板（可选）
 
@@ -282,15 +306,19 @@ capture:
 
 ```yaml
 detector:
-  rknn_model: models/sprite_detector.rknn   # NPU 模型路径
-  onnx_model: models/sprite_detector.onnx   # CPU 备选模型
+  onnx_model: models/sprite_detector.onnx   # ONNX 模型路径
   input_size: [640, 640]                    # YOLO 输入尺寸
   conf_threshold: 0.5                       # 检测置信度阈值
   nms_threshold: 0.4                        # NMS 去重阈值
   classes:
-    - normal      # 普通精灵
-    - shiny       # 异色精灵（优先捕捉）
-    - corrupted   # 污染精灵
+    - huzhu_quan         # 0: 护主犬
+    - yibei_er           # 1: 伊贝儿
+    - emo_ding           # 2: 恶魔叮
+    - juhua_li           # 3: 菊花梨
+    - gongping_ge        # 4: 公平鸽
+    - ling_hu            # 5: 灵狐
+    - xiao_dujiaoshou    # 6: 小独角兽
+    - xiaoye_yifu        # 7: 小夜/朔夜伊芙
 
   template:
     match_threshold: 0.7      # 模板匹配阈值
@@ -316,36 +344,47 @@ tracker:
 </details>
 
 <details>
-<summary><b>controller</b> — 鼠标控制（只用鼠标，不走键盘）</summary>
+<summary><b>controller</b> — 鼠标控制（人类行为模拟 + 长按瞄准 + 视角旋转）</summary>
 
 ```yaml
 controller:
   mouse_sensitivity: 1.0    # 鼠标移动灵敏度
   throw_hold_time: 500      # 长按时间 (ms)
   click_delay: 100          # 点击间隔 (ms)
+
+  # 人类行为模拟（避免被检测为脚本）
+  humanize: true
+  humanize_config:
+    jitter_amplitude: 3         # 轨迹噪声（像素）
+    overshoot_probability: 0.15 # 过冲概率
+    speed_variation: 0.3        # 速度变化幅度
+
+  # 瞄准模式
+  aim:
+    move_steps: 20              # 平滑移动步数
+    step_delay: 2               # 每步间隔 (ms)
+    settle_delay: 80            # 到达后稳定 (ms)
+    default_mode: hold_aim      # hold_aim=长按瞄准, click=点击丢球
+
+  # 视角旋转（视野内无精灵时自动旋转）
+  pan:
+    amount: 200                 # 单次旋转像素量
+    default_direction: right    # 默认方向
+    alternate: true             # 左右交替
+    scan_width: 600             # 全景扫描宽度
+
   keyboard_device: /dev/hidg0
-  mouse_device: /dev/hidg1  # 若不存在会自动用 find_mouse_hid() 探测
+  mouse_device: /dev/hidg1
   keymap:
     interact: w
-    throw_ball: r
-    run: shift
-    skill1: "1"
-    skill2: "2"
-    escape: esc
-    confirm: enter
     focus: x
-  aim:
-    move_steps: 20          # 鼠标平滑移动步数
-    step_delay: 2           # 每步间隔 (ms)
-    settle_delay: 80        # 到达后稳定 (ms)
+    # ... 其余按键映射
   calibration:              # 采集画面 → 游戏画面坐标校准
     offset_x: 0
     offset_y: 0
     scale_x: 1.0
     scale_y: 1.0
 ```
-
-> ⚠️ **鼠标设备自动发现**：`mouse_device` 配置的路径如果不存在（如 `/dev/hidg1`），`controller.py` 会通过 `find_mouse_hid()` 在 configfs 中搜索 `hid.mouse` 对应的实际 `/dev/hidg*` 节点。`rockchip-mouse` 模式下节点通常是 `/dev/hidg2`。
 </details>
 
 <details>
@@ -356,10 +395,20 @@ automation:
   scan_interval: 0.5           # 扫描间隔 (秒)
   max_throw_attempts: 3        # 每个目标最多丢球次数
   verify_wait: 3.0             # 丢球后等待验证结果的时间 (秒)
-  target_priority:             # 精灵优先级（排前面的优先）
-    - shiny
-    - corrupted
-    - normal
+  target_priority:             # 精灵优先级
+    - huzhu_quan
+    - yibei_er
+    - emo_ding
+    - juhua_li
+    - gongping_ge
+    - ling_hu
+    - xiao_dujiaoshou
+    - xiaoye_yifu
+
+  pan:                         # 视角自动旋转
+    enabled: true              # 是否启用
+    empty_scans_before_pan: 5  # 连续空扫描后旋转
+    scan_width: 600            # 全景扫描宽度
 ```
 </details>
 
@@ -408,9 +457,9 @@ UI 模板匹配以 OpenCV TM_CCOEFF_NORMED 方式与 YOLO 并行运行。
 
 ### 精灵捕捉完整流程
 
-1. **SCAN**：每 0.5s 检测画面中的精灵
+1. **SCAN**：每 0.5s 检测画面中的精灵；连续 5 次空扫描 → 自动旋转视角搜索
 2. **TRACK**：卡尔曼滤波追踪精灵位置，处理短暂遮挡
-3. **AIM**：**按住鼠标左键** + 移动光标到精灵位置（只用鼠标，不走键盘）
+3. **AIM**：**按住鼠标左键** + 移动光标到精灵位置（默认长按瞄准模式）
 4. **THROW**：**松开左键 = 丢球**，最多尝试 3 次
 5. **VERIFY**：四步判定 —
    - 检测"捕捉成功"UI → 成功
@@ -418,21 +467,29 @@ UI 模板匹配以 OpenCV TM_CCOEFF_NORMED 方式与 YOLO 并行运行。
    - 精灵仍在画面中 → 失败，重试
    - 检测"战斗界面"UI → 进入战斗
 
-> ⚠️ **只用鼠标丢球，键盘不可用。** 游戏只响应鼠标操作，不要使用键盘 R 键等其他方式。
+**控制器特性**：
+- **人类行为模拟**：鼠标移动加入随机抖动、过冲回正、速度变化
+- **长按瞄准优先**：默认先进入瞄准状态再丢球，准确性更高
+- **视角自动旋转**：找不到精灵时左右交替旋转视野
+
+> ⚠️ **只用鼠标丢球，键盘不可用。** 游戏只响应鼠标操作。
 
 ---
 
 ## 下一步内容
 
-### 短期（待完善）
+### 短期（进行中）
 
-- [x] **模型训练/微调** — 训练工具链已完成（`scripts/capture_screenshots.py` + `label_tool.py` + `train_model.py`），**待采集标注数据后实际训练**
-- [x] **丢球操作修正** — 按住左键瞄准 + 松开左键丢球（纯鼠标，游戏自动瞄准）
+- [x] **模型训练/微调** — 训练工具链已完成，支持增量训练
+- [x] **丢球操作修正** — 按住左键瞄准 + 松开左键丢球（纯鼠标）
 - [x] **捕捉验证增强** — 四步判定：成功UI / 失败UI / 精灵存在 / 战斗UI
-- [ ] **模型训练执行** — 采集 50-100+ 张游戏截图并用 label_tool 标注，然后运行 train_model.py
-- [ ] **游戏兼容性** — 适配更多分辨率、不同战斗场景
+- [x] **人类行为模拟** — 鼠标移动随机抖动/过冲/速度变化
+- [x] **视角自动旋转** — 空扫描自动全景搜索
+- [x] **小独角兽模型** — mAP50=0.995, ONNX 已导出
+- [x] **小独角兽模型 V4** — 昼夜通用，检出率 95% (19/20)，ONNX 已导出
+- [ ] **其他6只精灵** — 录制视频 → 提取帧 → 增量训练
 - [ ] **补充 UI 模板** — 截取 capture_success/fail/battle_ui 等模板
-- [ ] **战斗逻辑优化** — 加入技能选择、道具使用、逃跑策略
+- [ ] **游戏兼容性** — 适配更多分辨率、不同战斗场景
 - [ ] **状态机健壮性** — 增加更多错误恢复路径
 - [ ] **Web 管理面板** — 远程查看状态、截图、日志
 
@@ -545,6 +602,51 @@ bash setup_gadget.sh status
 | HDMI 采集 | ✅ GStreamer v4l2src io-mode=4, 1920×1080 |
 | OpenCV 显示 | ✅ debug 模式窗口在 GStreamer 前创建，无 Qt/GLib 冲突 |
 | motion 检测 + 状态机循环 | ✅ scan → track → aim → throw → verify 完整跑通 |
+
+### 2026-06-03 物种识别模型训练 + 控制器优化
+
+| 项目 | 结果 |
+|------|------|
+| 精灵分类方案 | ✅ 从 3 类(normal/shiny/corrupted) 升级为 8 物种识别 |
+| 爬虫采集 | ✅ 百度图片搜索可用（需代理），百度 CDN 缩略图可直接下载 |
+| 视频帧提取 | ✅ `extract_frames.py` 支持去重/间隔采样，OBS 框选区域录制最佳 |
+| 自动标注 | ✅ 运动检测 + 边缘检测自动生成 YOLO 标注框 |
+| 小独角兽模型 | ✅ mAP50=0.995, mAP50-95=0.966, ONNX 11.7MB |
+| PyTorch CUDA | ✅ nightly cu128 支持 RTX 5060 Ti (Blackwell sm_120) |
+| 人类行为模拟 | ✅ 鼠标轨迹随机抖动、过冲回正、速度变化 |
+| 长按瞄准默认 | ✅ `default_aim_mode: hold_aim` 先瞄准再丢球 |
+| 视角自动旋转 | ✅ SCAN 状态连续空扫描触发全景搜索 |
+| 配置文件更新 | ✅ config.yaml 适配 8 物种 + humanize + pan 参数 |
+
+### 2026-06-03 V4 昼夜模型 + 部署就绪
+
+| 项目 | 结果 |
+|------|------|
+| 训练数据 | 2段视频(58帧) + 夜间10张 + 白天9张 → 1617张增强 |
+| 夜间检测 | ✅ 10/10，置信度 0.86-0.97 |
+| 白天检测 | ✅ 9/10，置信度 0.43-0.83 |
+| 综合检出率 | **95% (19/20)** |
+| ONNX 模型 | models/sprite_detector.onnx (11.7MB) |
+| 部署 | 拷贝到开发板 `models/` 目录即可使用 |
+
+### PC 训练工作流
+
+> 训练在 Windows PC (5060 Ti 16GB) 上完成，ONNX 模型部署到 Orange Pi。
+
+```bash
+# 完整流程：录视频 → 提取帧 → 自动标注 → 训练
+# 详见上方 "2. 放置模型文件" 章节
+
+# 1. 录视频 (OBS 框选精灵区域)
+# 2. 提取帧
+python scripts/extract_frames.py dataset/video/xxx.mp4 --sprite xiao_dujiaoshou --fps 2
+# 3. 自动标注
+python scripts/auto_label.py dataset/raw_xiao_dujiaoshou/ --class-id 6
+# 4. 增量训练
+python scripts/incremental_train.py --new-data dataset/labeled_xiao_dujiaoshou/ --device cuda
+# 5. 部署
+scp models/sprite_detector.onnx orangepi@<ip>:/home/orangepi/Desktop/rock/models/
+```
 
 ---
 

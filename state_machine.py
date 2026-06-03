@@ -417,6 +417,13 @@ class CapturePipeline:
         self.target_priority = auto_cfg.get("target_priority",
                                             ["shiny", "corrupted", "normal"])
 
+        # 视角旋转配置
+        pan_cfg = auto_cfg.get("pan", {})
+        self.pan_enabled = pan_cfg.get("enabled", True)
+        self.pan_after_empty_scans = pan_cfg.get("empty_scans_before_pan", 5)
+        self.pan_scan_width = pan_cfg.get("scan_width", 600)
+        self._empty_scan_count = 0  # 连续空扫描计数
+
         # 状态机
         self.fsm = CaptureStateMachine()
 
@@ -446,7 +453,7 @@ class CapturePipeline:
         return None
 
     def _on_scan(self) -> Optional[Event]:
-        """扫描画面中的精灵。"""
+        """扫描画面中的精灵。连续空扫描后自动旋转视角扩大搜索范围。"""
         # 从 capture 模块获取帧 (通过外部注入)
         frame = self._frame_provider() if self._frame_provider else None
 
@@ -458,6 +465,9 @@ class CapturePipeline:
         detections = self.detector.detect_sprites(frame)
 
         if detections:
+            # 找到精灵 → 重置空扫描计数器
+            self._empty_scan_count = 0
+
             # 更新追踪器
             detections = self.tracker.update(detections)
 
@@ -469,9 +479,23 @@ class CapturePipeline:
 
             if self._current_target:
                 self._throw_count = 0
-                log.info(f"Found sprite: {self._current_target.get('class')} "
+                cls_name = self._current_target.get('class', '?')
+                log.info(f"Found sprite: {cls_name} "
                          f"conf={self._current_target.get('confidence', 0):.2f}")
                 return Event.SPRITE_FOUND
+
+        else:
+            # 未检测到精灵
+            self._empty_scan_count += 1
+
+            # 连续多次空扫描 → 旋转视角扩大搜索
+            if (self.pan_enabled and
+                    self.controller is not None and
+                    self._empty_scan_count >= self.pan_after_empty_scans):
+                log.info(f"No sprite for {self._empty_scan_count} scans, "
+                         f"panning view...")
+                self.controller.pan_view_scan(scan_width=self.pan_scan_width)
+                self._empty_scan_count = 0  # 重置计数
 
         time.sleep(self.scan_interval)
         return Event.NO_SPRITE
@@ -508,44 +532,72 @@ class CapturePipeline:
         return Event.NO_SPRITE
 
     def _on_aim(self) -> Optional[Event]:
-        """按住左键瞄准：移动光标到精灵 + 按住左键不放。"""
+        """
+        瞄准状态。
+        默认模式 (hold_aim): 按住左键 → 移动光标到精灵 → 保持按住。
+        精灵移动时会微调光标位置。
+        """
         pos = self.tracker.get_target_position()
         if pos is None:
+            # 目标丢失，重置瞄准
+            if self.controller is not None:
+                self.controller.mouse.release_button()
             return Event.NO_SPRITE
 
         self._target_position = pos
 
         if self.controller is not None:
             cls = self._current_target.get('class', '?') if self._current_target else '?'
-            log.info(f"Aim: holding LEFT button, target={cls} pos={pos}")
-            self.controller.start_aim(pos[0], pos[1])
+            log.info(f"Aim: target={cls} pos={pos} | mode={self.controller.default_aim_mode}")
 
-            # 短暂跟踪：移动后重新检测，精灵动了就微调
-            new_pos = self.tracker.get_target_position()
-            if new_pos is not None:
-                drift = distance(pos, new_pos)
-                if drift > 30:
-                    self.controller.aim_at_target(new_pos[0], new_pos[1])
-                    self._target_position = new_pos
+            if self.controller.default_aim_mode == "hold_aim":
+                # 默认模式：按住左键进行瞄准 (长按瞄准)
+                self.controller.start_aim(pos[0], pos[1])
+
+                # 跟踪精灵移动：重新检测，微调光标
+                new_pos = self.tracker.get_target_position()
+                if new_pos is not None:
+                    drift = distance(pos, new_pos)
+                    if drift > 20:
+                        log.debug(f"Aim drift {drift:.0f}px, readjusting...")
+                        self.controller.aim_at_target(new_pos[0], new_pos[1])
+                        self._target_position = new_pos
+            else:
+                # 备选模式：只移动光标，不按任何键 (传统点击模式)
+                self.controller.aim_at_target(pos[0], pos[1])
         else:
             time.sleep(0.15)
 
         return Event.AIM_READY
 
     def _on_throw(self) -> Optional[Event]:
-        """松开左键 = 丢球！"""
+        """
+        丢球状态。
+        默认 (hold_aim): 松开左键 = 丢球 (因为瞄准时已按住左键)。
+        备选 (click): 点击左键丢球。
+        """
         self._throw_count += 1
         self.fsm.record_throw()
-
-        log.info(f"Throw {self._throw_count}/{self.max_throw_attempts}: "
-                 f"releasing LEFT button")
 
         if self.controller is None:
             log.warning("Controller unavailable, simulating throw")
             time.sleep(0.5)
             return Event.THROW_DONE
 
-        self.controller.release_throw()
+        if self.controller.default_aim_mode == "hold_aim":
+            # 松开左键 = 丢球 (瞄准时已按住)
+            log.info(f"Throw {self._throw_count}/{self.max_throw_attempts}: "
+                     f"releasing LEFT button (hold_aim mode)")
+            self.controller.release_throw()
+        else:
+            # 点击丢球
+            pos = self._target_position
+            if pos:
+                log.info(f"Throw {self._throw_count}/{self.max_throw_attempts}: "
+                         f"clicking at {pos}")
+                self.controller.throw_ball_click_mode(pos[0], pos[1])
+            else:
+                self.controller.mouse.click("left")
 
         time.sleep(0.5)  # 等待投掷动画
         return Event.THROW_DONE

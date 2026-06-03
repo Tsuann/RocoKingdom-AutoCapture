@@ -45,7 +45,32 @@ from utils import log
 # ============================================================
 # 默认配置
 # ============================================================
-DEFAULT_CLASSES = ["normal", "shiny", "corrupted"]
+
+# S2 赛季精灵物种分类 (可出异色的8只常驻精灵)
+# 训练时只识别普通种族的精灵外形，异色版本外形相同仅颜色不同
+DEFAULT_CLASSES = [
+    "huzhu_quan",         # 0: 护主犬 (音速犬)
+    "yibei_er",           # 1: 伊贝儿
+    "emo_ding",           # 2: 恶魔叮
+    "juhua_li",           # 3: 菊花梨
+    "gongping_ge",        # 4: 公平鸽
+    "ling_hu",            # 5: 灵狐
+    "xiao_dujiaoshou",    # 6: 小独角兽
+    "xiaoye_yifu",        # 7: 小夜/朔夜伊芙
+]
+
+# 类别中文名映射 (用于显示)
+CLASS_NAMES_CN = {
+    "huzhu_quan": "护主犬",
+    "yibei_er": "伊贝儿",
+    "emo_ding": "恶魔叮",
+    "juhua_li": "菊花梨",
+    "gongping_ge": "公平鸽",
+    "ling_hu": "灵狐",
+    "xiao_dujiaoshou": "小独角兽",
+    "xiaoye_yifu": "小夜/朔夜伊芙",
+}
+
 DEFAULT_MODEL = "yolov8n.pt"   # YOLOv8 nano (最小最快)
 DEFAULT_EPOCHS = 100
 DEFAULT_IMGSZ = 640

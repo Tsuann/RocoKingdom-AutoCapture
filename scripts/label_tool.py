@@ -7,7 +7,7 @@
 
 操作:
     鼠标拖拽  — 画矩形框
-    N / S / C  — 切换当前类别 (Normal / Shiny / Corrupted)
+    1-8        — 切换当前类别 (护主犬/伊贝儿/恶魔叮/菊花梨/公平鸽/灵狐/小独角兽/小夜)
     D          — 删除最后画的框
     ENTER      — 保存标注并加载下一张图
     ESC        — 跳过当前图片 (不保存)
@@ -29,11 +29,27 @@ import numpy as np
 # ============================================================
 # 默认类别
 # ============================================================
-DEFAULT_CLASSES = ["normal", "shiny", "corrupted"]
+# S2 赛季精灵物种分类 (可出异色的8只常驻精灵)
+DEFAULT_CLASSES = [
+    "huzhu_quan",         # 0: 护主犬 (音速犬)
+    "yibei_er",           # 1: 伊贝儿
+    "emo_ding",           # 2: 恶魔叮
+    "juhua_li",           # 3: 菊花梨
+    "gongping_ge",        # 4: 公平鸽
+    "ling_hu",            # 5: 灵狐
+    "xiao_dujiaoshou",    # 6: 小独角兽
+    "xiaoye_yifu",        # 7: 小夜/朔夜伊芙
+]
+
 CLASS_COLORS = {
-    0: (0, 255, 0),    # normal → 绿色
-    1: (0, 255, 255),  # shiny → 黄色
-    2: (0, 0, 255),    # corrupted → 红色
+    0: (0, 255, 0),      # 护主犬 → 绿色
+    1: (255, 128, 0),    # 伊贝儿 → 橙色
+    2: (255, 0, 255),    # 恶魔叮 → 紫色
+    3: (0, 255, 255),    # 菊花梨 → 黄色
+    4: (255, 0, 0),      # 公平鸽 → 蓝色
+    5: (0, 128, 255),    # 灵狐 → 天蓝
+    6: (128, 0, 255),    # 小独角兽 → 紫罗兰
+    7: (255, 255, 0),    # 小夜 → 青色
 }
 
 
@@ -118,9 +134,9 @@ class LabelTool:
 
         # 状态栏
         status = (f"Image: {self.current_idx + 1}/{len(self.image_files)}  |  "
-                  f"Class: [{self.classes[self.current_class]}]  |  "
+                  f"Class: [{self.current_class}] {self.classes[self.current_class]}  |  "
                   f"Boxes: {len(self.boxes)}  |  "
-                  f"N/S/C=class  D=del  Enter=save  Esc=skip  Q=quit")
+                  f"1-8=class  D=del  Enter=save  Esc=skip  Q=quit")
         cv2.putText(self.display, status, (10, h - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
@@ -201,15 +217,11 @@ class LabelTool:
                 print("退出程序")
                 break
 
-            elif key == ord('n'):
-                self.current_class = 0
-                print(f"当前类别: {self.classes[0]}")
-            elif key == ord('s'):
-                self.current_class = 1
-                print(f"当前类别: {self.classes[1]}")
-            elif key == ord('c'):
-                self.current_class = 2
-                print(f"当前类别: {self.classes[2]}")
+            elif ord('1') <= key <= ord('8'):
+                cls_idx = key - ord('1')
+                if cls_idx < len(self.classes):
+                    self.current_class = cls_idx
+                    print(f"当前类别: [{cls_idx}] {self.classes[cls_idx]}")
 
             elif key == ord('d'):
                 if self.boxes:
@@ -244,8 +256,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="YOLO 图像标注工具 — 在截图上画框生成训练数据")
     parser.add_argument("image_dir", help="截图目录路径")
-    parser.add_argument("--classes", default="normal,shiny,corrupted",
-                        help="类别名，逗号分隔 (默认: normal,shiny,corrupted)")
+    parser.add_argument("--classes", default="huzhu_quan,yibei_er,emo_ding,juhua_li,"
+                        "gongping_ge,ling_hu,xiao_dujiaoshou,xiaoye_yifu",
+                        help="类别名，逗号分隔")
     parser.add_argument("--output", default=None,
                         help="标注输出目录 (默认: {image_dir}/../labeled)")
     args = parser.parse_args()
