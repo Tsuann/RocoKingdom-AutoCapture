@@ -20,6 +20,19 @@ from typing import Optional, Tuple
 from utils import log
 
 
+def _configfs_has_function(func_name: str) -> bool:
+    """检查 configfs 中是否存在指定的 HID function (如 hid.kbd, hid.mouse)。"""
+    gadget_root = "/sys/kernel/config/usb_gadget"
+    try:
+        for gadget in os.listdir(gadget_root):
+            func_path = os.path.join(gadget_root, gadget, "functions", func_name)
+            if os.path.isdir(func_path):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def hid_transport_ready() -> bool:
     """检查 USB 主机是否已经完成 gadget 枚举配置。"""
     udc_root = "/sys/class/udc"
@@ -303,6 +316,7 @@ class MouseController:
         self._report_length = 4
         self._current_x = screen_width // 2
         self._current_y = screen_height // 2
+        self._current_buttons = 0  # 追踪当前按下的鼠标按键状态
 
         # 人类行为模拟参数
         self.humanize_enabled = True
@@ -346,7 +360,7 @@ class MouseController:
     # ----------------------------------------------------------
 
     def move(self, dx: int, dy: int):
-        """相对移动鼠标。"""
+        """相对移动鼠标。保持当前按键状态（修复丢球 bug）。"""
         # 应用灵敏度和限制范围
         dx = int(dx * self.sensitivity)
         dy = int(dy * self.sensitivity)
@@ -358,7 +372,7 @@ class MouseController:
         self._current_y = max(0, min(self.screen_height - 1,
                                      self._current_y + dy))
 
-        self._send_report(buttons=0, x=dx, y=dy)
+        self._send_report(buttons=self._current_buttons, x=dx, y=dy)
 
     def move_to(self, target_x: int, target_y: int,
                 steps: int = 20, step_delay: float = 0.002):
@@ -483,11 +497,11 @@ class MouseController:
 
     def pan_view_humanized(self, direction: str = "right",
                            amount: int = 200,
-                           min_steps: int = 8,
-                           max_steps: int = 20):
+                           min_steps: int = 12,
+                           max_steps: int = 18):
         """
         带人类行为模拟的视角旋转。
-        速度不均匀、有停顿、偶尔反向微调。
+        固定方向慢速旋转，避免左右大幅晃动。
 
         Args:
             direction: "left" 或 "right"
@@ -514,29 +528,28 @@ class MouseController:
                 self.move(step_dx, jitter_y)
             remaining -= step_dx
 
-            # 随机停顿
-            delay = random.uniform(0.008, 0.025)
+            # 慢速停顿，降低镜头旋转速度和采集压力
+            delay = random.uniform(0.025, 0.05)
             time.sleep(delay)
-
-            # 偶尔反向微调
-            if self.humanize_enabled and random.random() < 0.15:
-                self.move(-random.randint(1, 5), random.randint(-2, 2))
-                time.sleep(random.uniform(0.005, 0.015))
 
     def click(self, button: str = "left", duration: float = 0.05):
         """点击鼠标按键。"""
         btn_mask = MOUSE_BUTTON.get(button, 0x01)
+        self._current_buttons = btn_mask
         self._send_report(buttons=btn_mask)
         time.sleep(duration)
+        self._current_buttons = 0
         self._send_report(buttons=0)
 
     def hold(self, button: str = "left"):
         """按住鼠标按键 (不释放)。"""
         btn_mask = MOUSE_BUTTON.get(button, 0x01)
+        self._current_buttons = btn_mask
         self._send_report(buttons=btn_mask)
 
     def release_button(self):
         """释放所有鼠标按键。"""
+        self._current_buttons = 0
         self._send_report(buttons=0)
 
     def hold_for(self, button: str = "left",
@@ -549,10 +562,11 @@ class MouseController:
     def scroll(self, amount: int):
         """滚轮滚动 (正=上, 负=下)。"""
         amount = max(-127, min(127, amount))
-        self._send_report(buttons=0, wheel=amount)
+        self._send_report(buttons=self._current_buttons, wheel=amount)
 
     def release_all(self):
         """释放所有按键。"""
+        self._current_buttons = 0
         self._send_report(buttons=0)
 
     # ----------------------------------------------------------
@@ -680,6 +694,30 @@ class GameController:
         self.aim_move_steps = aim_cfg.get("move_steps", 20)
         self.aim_step_delay = aim_cfg.get("step_delay", 2) / 1000.0
         self.aim_settle_delay = aim_cfg.get("settle_delay", 80) / 1000.0
+        self.aim_hold_time = aim_cfg.get("hold_time", 2000) / 1000.0  # 蓄力时间
+        self.aim_enter_delay = aim_cfg.get("enter_delay", 180) / 1000.0
+        self.parabolic_factor = aim_cfg.get("parabolic_factor", 0.15)  # 抛物线修正系数
+        self.aim_target_x_ratio = aim_cfg.get("target_x_ratio", 0.5)
+        self.aim_target_y_ratio = aim_cfg.get("target_y_ratio", 0.30)
+        self.aim_fallback_y_offset = aim_cfg.get("fallback_y_offset", -60)
+        self.aim_charge_update_interval = aim_cfg.get("charge_update_interval", 0.08)
+        # PID 参数
+        self.pid_kP = aim_cfg.get("pid_kP", 0.6)              # 比例系数
+        self.pid_max_step = aim_cfg.get("pid_max_step", 30)   # 单步最大像素
+        self.pid_min_step = aim_cfg.get("pid_min_step", 0)     # 小步死区
+        self.pid_step_wait = aim_cfg.get("pid_step_wait", 0.03)  # 每步间隔
+        self.pid_align_threshold = aim_cfg.get("pid_align_threshold", 10)  # 对齐阈值
+        self.pid_max_iters = aim_cfg.get("pid_max_iters", 50)  # 最大迭代次数
+        self.pid_detect_interval = max(1, int(aim_cfg.get("pid_detect_interval", 3)))
+        self.aim_smoothing = max(0.0, min(0.95, aim_cfg.get("aim_smoothing", 0.0)))
+        self.pre_throw_confirmations = max(0, int(aim_cfg.get("pre_throw_confirmations", 2)))
+        self.pre_throw_interval = aim_cfg.get("pre_throw_interval", 0.08)
+        self.pre_throw_threshold = aim_cfg.get("pre_throw_threshold", 14)
+        self.pre_throw_max_checks = max(
+            self.pre_throw_confirmations,
+            int(aim_cfg.get("pre_throw_max_checks", 6)),
+        )
+        self.pre_throw_reaim_rounds = max(1, int(aim_cfg.get("pre_throw_reaim_rounds", 2)))
 
         # 坐标校准
         calib = ctrl_cfg.get("calibration", {})
@@ -710,12 +748,26 @@ class GameController:
             log.error("Then connect USB OTG cable to PC and wait for enumeration.")
             return False
 
-        kbd_ok = self.kbd.open()
+        # 先打开鼠标（会做 auto-detect），再决定是否打开键盘
         mouse_ok = self.mouse.open()
-        if not kbd_ok:
-            log.warning("Keyboard unavailable; mouse-only control enabled")
-        log.info(f"Mouse device: {self.mouse.device_path}")
-        return mouse_ok
+        if not mouse_ok:
+            return False
+
+        # 检查键盘设备是否与鼠标冲突（同一 /dev/hidg* 设备）
+        # 如果只有 hid.mouse 没有 hid.kbd，键盘报告会污染鼠标数据流
+        kbd_path = self.kbd.device_path
+        mouse_path = self.mouse.device_path
+        has_kbd_function = _configfs_has_function("hid.kbd")
+
+        if kbd_path == mouse_path or not has_kbd_function:
+            log.info("No dedicated keyboard HID — mouse-only control (no keyboard)")
+            self.kbd._fd = None  # 阻止键盘写入
+        else:
+            self.kbd.open()
+            log.info(f"Keyboard opened: {kbd_path}")
+
+        log.info(f"Mouse device: {mouse_path}")
+        return True
 
     def close(self):
         self.kbd.close()
@@ -753,6 +805,77 @@ class GameController:
         self.aim_at_target(target_x, target_y)
         log.info(f"Aim: holding LEFT button at ({target_x}, {target_y})")
         self.mouse.hold("left")
+
+    def aim_drag_corrected(self, target_x: int, target_y: int):
+        """
+        精确瞄准：移动→按住→从屏幕中心拖拽到精灵位置（含抛物线修正）。
+
+        游戏机制：
+        1. 鼠标移到精灵位置（告诉游戏瞄准哪个精灵）
+        2. 按住左键进入瞄准模式（准星回到屏幕中心）
+        3. 从中心向精灵方向拖拽 = 实际瞄准
+        4. 抛物线修正：精灵越远，准星越要偏上
+
+        Args:
+            target_x, target_y: 精灵在采集画面中的坐标
+        """
+        sw = self.mouse.screen_width
+        sh = self.mouse.screen_height
+        center_x, center_y = sw // 2, sh // 2
+
+        gx, gy = self.capture_to_game_coord(target_x, target_y)
+
+        # Step 1: 移动光标到精灵位置（识别目标）
+        log.info(f"Aim step1: moving to sprite at ({gx}, {gy})")
+        self.mouse.move_to(gx, gy,
+                           steps=self.aim_move_steps,
+                           step_delay=self.aim_step_delay)
+        if self.aim_settle_delay > 0:
+            time.sleep(self.aim_settle_delay)
+
+        # Step 2: 按住左键进入瞄准模式（准星回到中心）
+        log.info(f"Aim step2: holding LEFT, crosshair centers at ({center_x}, {center_y})")
+        self.mouse.hold("left")
+        time.sleep(0.1)  # 等游戏响应
+
+        # Step 3: 计算从中心到精灵的偏移量
+        dx = gx - center_x
+        dy = gy - center_y
+        dist = (dx ** 2 + dy ** 2) ** 0.5
+
+        # 抛物线修正：越远越要往上瞄
+        # 球飞行过程中会下坠，准星需要比精灵实际位置更高
+        parabolic_offset = int(dist * self.parabolic_factor)
+        dy_corrected = dy - parabolic_offset
+
+        # 最大距离限制（避免拖出屏幕太远）
+        max_drag = min(sw, sh) // 2
+        dx = max(-max_drag, min(max_drag, dx))
+        dy_corrected = max(-max_drag, min(max_drag, dy_corrected))
+
+        log.info(f"Aim step3: drag offset=({dx}, {dy_corrected}) "
+                 f"dist={dist:.0f}px parabolic={parabolic_offset}px "
+                 f"(raw=({dx},{dy}))")
+
+        # Step 4: 按住拖拽 — 从中心向精灵方向移动
+        # 分多步平滑拖拽（每步 ~15px，模拟人类操作）
+        total_steps = max(8, int(dist / 12))
+        for i in range(1, total_steps + 1):
+            t = i / total_steps
+            # ease-out: 先快后慢
+            ease = 1 - (1 - t) ** 2
+            step_dx = int(dx * ease) - int(dx * (1 - (1 - (t - 1/total_steps)) ** 2) if t > 0 else 0)
+            # 简化：直接用差值
+            prev_ease = 1 - (1 - (i - 1) / total_steps) ** 2 if i > 1 else 0
+            step_dx = int(dx * (ease - prev_ease))
+            step_dy = int(dy_corrected * (ease - prev_ease))
+
+            if step_dx != 0 or step_dy != 0:
+                self.mouse.move(step_dx, step_dy)
+            time.sleep(random.uniform(0.008, 0.02))
+
+        log.info(f"Aim step4: drag complete, positioned at "
+                 f"({self.mouse.position[0]}, {self.mouse.position[1]})")
 
     def release_throw(self):
         """松开左键 = 丢球！"""

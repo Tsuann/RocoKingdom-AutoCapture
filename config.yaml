@@ -7,7 +7,7 @@ capture:
   device: 0                       # /dev/video0
   width: 1920
   height: 1080
-  fps: 30                         # 处理帧率限制
+  fps: 30                         # 采集帧率 (PC 输出 30Hz 时可设 30)
 
 # ---- 精灵检测 ----
 detector:
@@ -17,20 +17,22 @@ detector:
   onnx_model: models/sprite_detector.onnx
   # 检测参数
   input_size: [640, 640]          # YOLO 输入尺寸
-  conf_threshold: 0.5             # 置信度阈值
+  conf_threshold: 0.16            # 置信度阈值 (太低会产生大量误检)
   nms_threshold: 0.4              # NMS IoU 阈值
 
-  # 类别名称 — S2赛季可出异色的8只常驻精灵 (物种级识别)
-  # 模型只识别普通精灵外形 (异色版本只是颜色不同，外形不变)
+  # 类别名称 — 当前模型为单类检测（仅小独角兽）
+  # 模型输出 5 通道 (cx,cy,w,h,conf)，无分类头
+  # 多类模型训练完成后取消注释下方的完整列表
   classes:
-    - huzhu_quan         # 0: 护主犬 (音速犬)
-    - yibei_er           # 1: 伊贝儿
-    - emo_ding           # 2: 恶魔叮
-    - juhua_li           # 3: 菊花梨
-    - gongping_ge        # 4: 公平鸽
-    - ling_hu            # 5: 灵狐
-    - xiao_dujiaoshou    # 6: 小独角兽
-    - xiaoye_yifu        # 7: 小夜/朔夜伊芙
+    - xiao_dujiaoshou    # 0: 小独角兽（当前单类模型）
+  # - huzhu_quan         # 0: 护主犬 (音速犬)
+  # - yibei_er           # 1: 伊贝儿
+  # - emo_ding           # 2: 恶魔叮
+  # - juhua_li           # 3: 菊花梨
+  # - gongping_ge        # 4: 公平鸽
+  # - ling_hu            # 5: 灵狐
+  # - xiao_dujiaoshou    # 6: 小独角兽
+  # - xiaoye_yifu        # 7: 小夜/朔夜伊芙
 
   # 模板匹配 (UI 检测)
   # 验证精灵捕捉结果会用到以下模板 (放入 templates/ 目录):
@@ -65,19 +67,40 @@ controller:
 
   # 鼠标瞄准 + 丢球（只支持鼠标，不用键盘）
   aim:
-    move_steps: 20                # 平滑移动步数
-    step_delay: 2                 # 每步间隔 (ms)
+    move_steps: 12                # 平滑移动步数，越少越快
+    step_delay: 1                 # 每步间隔 (ms)
     settle_delay: 80              # 到达后稳定 (ms)
+    hold_time: 1500               # 蓄力时间 (ms)，蓄力完成后才能开始 PID 修正
+    enter_delay: 180               # 按住左键后等待准星进入/归中 (ms)
+    parabolic_factor: 0.4          # 抛物线修正系数（二次公式: offset = dist² * pf / sw，越大瞄得越高）
+    target_x_ratio: 0.5            # bbox 内瞄准点 X：0.5 = 水平中心
+    target_y_ratio: 0.30           # bbox 内瞄准点 Y：0.30 = 靠近头部，0.5 = 身体中心
+    fallback_y_offset: -60         # 没有 bbox 时，基于追踪中心向上偏移
+    charge_update_interval: 0.20   # 蓄力期间重新检测间隔 (s)
+    # PID 对准参数
+    pid_kP: 0.70                   # 比例系数（越大越快但可能过冲）
+    pid_max_step: 35               # 单步最大移动像素
+    pid_min_step: 2                # 小于该像素的修正忽略，减少抖动
+    pid_step_wait: 0.02            # 每步检测间隔 (s)
+    pid_align_threshold: 12        # 对齐阈值 (像素)，小于此值认为已对准
+    pid_max_iters: 70              # 最大迭代次数
+    pid_detect_interval: 3         # PID 每多少轮重新检测一次；1 = 每轮都跟踪
+    aim_smoothing: 0.65            # 瞄准点 EMA 平滑，越大越稳但响应越慢
+    pre_throw_confirmations: 0      # 出球前连续确认次数；0 = 关闭
+    pre_throw_interval: 0.06        # 出球前确认间隔 (s)
+    pre_throw_threshold: 10         # 出球前确认允许误差 (px)
+    pre_throw_max_checks: 8         # 最多确认次数；失败则继续 AIM 不松手
+    pre_throw_reaim_rounds: 2       # 确认失败后最多追加微调轮数
     # 丢球模式: "hold_aim" = 长按瞄准→松开丢球(推荐, 更准)
     #           "click"     = 传统点击丢球
     default_mode: hold_aim
 
   # 视角旋转 (视野内无精灵时自动旋转视角搜索)
   pan:
-    amount: 200                   # 单次旋转像素量
+    amount: 100                   # 单次旋转像素量，越小镜头越慢
     default_direction: right      # 默认旋转方向
-    alternate: true               # 是否左右交替旋转
-    scan_width: 600               # 全景扫描宽度
+    alternate: false              # 固定方向搜索，不左右大幅晃动
+    scan_width: 240               # 单轮最多旋转宽度
 
   # 采集画面 → 游戏画面坐标校准
   calibration:
@@ -103,9 +126,18 @@ controller:
 
 # ---- 自动化状态机 ----
 automation:
-  scan_interval: 0.5              # 扫描间隔 (秒)
+  scan_interval: 0.35             # 扫描间隔 (秒)
   max_throw_attempts: 3           # 最大丢球次数
-  verify_wait: 3.0                # 丢球后等待结果 (秒)
+  verify_wait: 1.8                # 丢球后等待结果 (秒)
+
+  # auto/debug-auto 专用检测过滤。debug 模式仍显示原始模型输出，方便对比。
+  detection_filter:
+    min_confidence: 0.16           # 保持与 detector.conf_threshold 一致，避免 auto 漏检更多
+    min_area_ratio: 0.00012        # 过滤极小噪点
+    max_area_ratio: 0.012          # 过滤大面积 UI/背景误检
+    min_aspect: 0.30               # bbox 宽高比下限
+    max_aspect: 3.2                # bbox 宽高比上限
+
   target_priority:                # 目标优先级 (按物种类别)
     - huzhu_quan
     - yibei_er
@@ -120,7 +152,11 @@ automation:
   pan:
     enabled: true                 # 是否启用自动旋转视角
     empty_scans_before_pan: 5     # 连续多少次空扫描后旋转视角
-    scan_width: 600               # 全景扫描宽度 (像素)
+    direction: right              # 固定扫描方向
+    step_pixels: 80               # 每一步转动像素，越小越稳
+    step_delay: 0.15              # 每一步后等待画面稳定 (s)
+    max_steps: 6                  # 单轮最多扫描步数；检测到精灵会立刻停止
+    hold_during_search: true      # 搜索自转时保持长按，发现目标后更快出球
 
 # ---- 热键 (通过键盘监听) ----
 hotkeys:

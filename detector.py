@@ -9,6 +9,7 @@
 """
 
 import os
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -93,13 +94,17 @@ def yolo_postprocess(output: np.ndarray,
                       frame_shape: Tuple[int, int],
                       conf_threshold: float = 0.5,
                       nms_threshold: float = 0.4,
-                      num_classes: int = 8) -> List[dict]:
+                      num_classes: int = 8,
+                      letterbox_params: Optional[Tuple[float, float, float]] = None,
+                      class_names: Optional[List[str]] = None,
+                      ) -> List[dict]:
     """
     YOLO 输出后处理。
 
-    支持两种常见 YOLO 输出格式:
-    - [1, N, 4+1+C] (含 objectness)
-    - [1, N, 4+C]   (不含 objectness，只有 class scores)
+    支持多种输出格式:
+    - [1, N, 4+1+C] (含 objectness + 分类 scores)
+    - [1, N, 4+C]   (只有分类 scores)
+    - [1, N, 5]     (单类检测: cx,cy,w,h,obj_conf，无分类头)
 
     Args:
         output: 模型原始输出
@@ -107,50 +112,66 @@ def yolo_postprocess(output: np.ndarray,
         frame_shape: 原始帧 (h, w, c)
         conf_threshold: 置信度阈值
         nms_threshold: NMS IoU 阈值
-        num_classes: 类别数
+        num_classes: 类别数（自动检测模型的类别数可能与此不同）
+        letterbox_params: (scale, dx, dy) 从预处理返回的 letterbox 参数。
+        class_names: 类别名称列表。单类模型时可传 ["精灵名"]。
 
     Returns:
         detections: [{"bbox": (x1,y1,x2,y2), "class": str, "confidence": float}, ...]
     """
+    if class_names is None:
+        class_names = DEFAULT_CLASSES
+
     # 展平
     if output.ndim == 3:
-        output = output.squeeze(0)  # (1, N, D) → (N, D)
+        output = output.squeeze(0)
 
     if output.size == 0 or output.ndim != 2:
         return []
+
+    # 自动检测方向: YOLO 输出通常是 [anchors, channels]
+    if output.shape[0] < output.shape[1] and output.shape[0] < 100:
+        output = output.T  # (C, A) → (A, C)
 
     num_dims = output.shape[1]
 
     # 判断格式
     if num_dims == 4 + num_classes:
-        # 无 objectness: [cx, cy, w, h, cls_0, ..., cls_C]
         has_objectness = False
     elif num_dims == 5 + num_classes:
-        # 有 objectness: [cx, cy, w, h, obj, cls_0, ..., cls_C]
         has_objectness = True
+    elif num_dims == 5:
+        # 单类检测: cx, cy, w, h, obj_conf（无分类头）
+        has_objectness = False
+        actual_num_classes = 1
+        log.debug(f"Single-class detector detected (5-dims output)")
+        num_classes = 1
     else:
-        log.warning(f"Unexpected YOLO output dims: {output.shape}, expected "
-                    f"{4 + num_classes} or {5 + num_classes}")
-        # 尝试兼容: 假设前4个是bbox
+        # 自动推断
         if num_dims < 5:
             return []
-        num_classes = num_dims - 4
-        has_objectness = (num_dims == 5 + num_classes)
-        if num_dims == 4 + num_classes:
-            has_objectness = False
+        actual_num_classes = num_dims - 4
+        has_objectness = False
+        log.debug(f"Auto-detected {actual_num_classes} classes from output dims "
+                  f"(config specified {num_classes})")
+        num_classes = actual_num_classes
 
     # 解析
-    boxes_raw = output[:, :4].copy()  # cx, cy, w, h (归一化 0-1)
+    boxes_raw = output[:, :4].copy()
 
-    if has_objectness:
+    if num_dims == 5:
+        # 单类检测：column 4 = objectness score
+        scores = output[:, 4]
+        class_ids = np.zeros(len(scores), dtype=int)  # 始终 class 0
+    elif has_objectness:
         obj_conf = output[:, 4:5]
         class_scores = output[:, 5:5 + num_classes]
         scores = obj_conf.squeeze(-1) * class_scores.max(axis=1)
+        class_ids = class_scores.argmax(axis=1)
     else:
         class_scores = output[:, 4:4 + num_classes]
         scores = class_scores.max(axis=1)
-
-    class_ids = class_scores.argmax(axis=1)
+        class_ids = class_scores.argmax(axis=1)
 
     # 置信度过滤
     mask = scores >= conf_threshold
@@ -161,17 +182,25 @@ def yolo_postprocess(output: np.ndarray,
     if len(boxes_raw) == 0:
         return []
 
-    # 坐标转换: cx,cy,w,h (归一化) → x1,y1,x2,y2 (像素坐标)
+    # 坐标转换
     in_w, in_h = input_shape
     f_h, f_w = frame_shape[:2]
-    scale_x = f_w / in_w
-    scale_y = f_h / in_h
 
-    px_boxes = np.zeros_like(boxes_raw)
-    px_boxes[:, 0] = (boxes_raw[:, 0] - boxes_raw[:, 2] / 2) * scale_x  # x1
-    px_boxes[:, 1] = (boxes_raw[:, 1] - boxes_raw[:, 3] / 2) * scale_y  # y1
-    px_boxes[:, 2] = (boxes_raw[:, 0] + boxes_raw[:, 2] / 2) * scale_x  # x2
-    px_boxes[:, 3] = (boxes_raw[:, 1] + boxes_raw[:, 3] / 2) * scale_y  # y2
+    if letterbox_params is not None:
+        lb_scale, dx, dy = letterbox_params
+        px_boxes = np.zeros_like(boxes_raw)
+        px_boxes[:, 0] = ((boxes_raw[:, 0] - boxes_raw[:, 2] / 2) - dx) / lb_scale
+        px_boxes[:, 1] = ((boxes_raw[:, 1] - boxes_raw[:, 3] / 2) - dy) / lb_scale
+        px_boxes[:, 2] = ((boxes_raw[:, 0] + boxes_raw[:, 2] / 2) - dx) / lb_scale
+        px_boxes[:, 3] = ((boxes_raw[:, 1] + boxes_raw[:, 3] / 2) - dy) / lb_scale
+    else:
+        scale_x = f_w / in_w
+        scale_y = f_h / in_h
+        px_boxes = np.zeros_like(boxes_raw)
+        px_boxes[:, 0] = (boxes_raw[:, 0] - boxes_raw[:, 2] / 2) * scale_x
+        px_boxes[:, 1] = (boxes_raw[:, 1] - boxes_raw[:, 3] / 2) * scale_y
+        px_boxes[:, 2] = (boxes_raw[:, 0] + boxes_raw[:, 2] / 2) * scale_x
+        px_boxes[:, 3] = (boxes_raw[:, 1] + boxes_raw[:, 3] / 2) * scale_y
 
     # NMS
     keep = _nms(px_boxes, scores, nms_threshold)
@@ -181,10 +210,12 @@ def yolo_postprocess(output: np.ndarray,
     for idx in keep:
         x1, y1, x2, y2 = px_boxes[idx].astype(int).tolist()
         cls_id = int(class_ids[idx])
+        cls_name = (class_names[cls_id] if cls_id < len(class_names)
+                    else f"cls_{cls_id}")
         results.append({
             "bbox": (max(0, x1), max(0, y1),
                      min(f_w, x2), min(f_h, y2)),
-            "class": DEFAULT_CLASSES[cls_id] if cls_id < len(DEFAULT_CLASSES) else f"cls_{cls_id}",
+            "class": cls_name,
             "confidence": float(scores[idx]),
         })
 
@@ -249,6 +280,9 @@ class TemplateMatcher:
         if names is None:
             names = list(self._templates.keys())
 
+        if not names:
+            return []  # 无模板，跳过灰度转换
+
         results = []
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -280,21 +314,28 @@ class TemplateMatcher:
 
 
 # ============================================================
-# YOLO 检测器: RKNN 版本
+# YOLO 检测器: RKNN NPU 版本 (ctypes 封装, 绕过 rknn-toolkit-lite2 的 bug)
 # ============================================================
 
 class RKNNDetector:
-    """使用 RKNN Runtime (NPU) 进行 YOLO 推理。"""
+    """使用 RK3588 NPU 进行 YOLO 推理。
+
+    通过 ctypes 直接调用 librknnrt.so，绕过 rknn-toolkit-lite2
+    的平台检测 bug ("Unsupported run platform: Linux aarch64")。
+
+    NPU 推理耗时 ~20-35ms (3核心)，比 ONNX CPU (~100-300ms) 快约 10x。
+    """
 
     def __init__(self, model_path: str, input_size: Tuple[int, int] = (640, 640),
                  conf_threshold: float = 0.5, nms_threshold: float = 0.4,
-                 num_classes: int = 8):
+                 num_classes: int = 8, class_names: list = None):
         self.model_path = model_path
         self.input_size = input_size
         self.conf_threshold = conf_threshold
         self.nms_threshold = nms_threshold
         self.num_classes = num_classes
-        self._rknn = None
+        self.class_names = class_names
+        self._npu = None
 
     def load(self) -> bool:
         """加载 RKNN 模型到 NPU。"""
@@ -303,28 +344,20 @@ class RKNNDetector:
             return False
 
         try:
-            from rknnlite.api import RKNNLite
-            self._rknn = RKNNLite()
-            ret = self._rknn.load_rknn(self.model_path)
-            if ret != 0:
-                log.error(f"RKNN load failed: {ret}")
-                return False
-
-            ret = self._rknn.init_runtime(
-                core_mask=RKNNLite.NPU_CORE_AUTO
-            )
-            if ret != 0:
-                log.error(f"RKNN init_runtime failed: {ret}")
-                return False
-
-            log.info(f"RKNN model loaded: {self.model_path}")
+            from npu_inference import NPUInference
+            self._npu = NPUInference(self.model_path)
+            in_shape = self._npu.input_shape
+            out_shape = self._npu.output_shape
+            log.info(f"RKNN NPU model loaded: {self.model_path}")
+            log.info(f"  Input:  {in_shape} ({'NHWC' if in_shape[-1] in (3,4) else 'NCHW'})")
+            log.info(f"  Output: {out_shape}")
             return True
 
         except ImportError:
-            log.error("rknnlite not installed")
+            log.error("npu_inference module not found")
             return False
         except Exception as e:
-            log.error(f"RKNN load error: {e}")
+            log.error(f"RKNN NPU load error: {e}")
             return False
 
     def detect(self, frame: np.ndarray) -> List[dict]:
@@ -334,62 +367,85 @@ class RKNNDetector:
         Returns:
             [{"bbox": (x1,y1,x2,y2), "class": str, "confidence": float}, ...]
         """
-        if self._rknn is None:
+        if self._npu is None:
             return []
 
         in_w, in_h = self.input_size
 
-        # 预处理
-        input_data, _ = self._preprocess(frame, (in_w, in_h))
-
-        # 推理
+        # 预处理: letterbox resize → NHWC uint8 (NPU 内部做 normalize)
         try:
-            outputs = self._rknn.inference(inputs=[input_data])
+            input_data, letterbox_params = self._preprocess_npu(frame, (in_w, in_h))
         except Exception as e:
-            log.error(f"RKNN inference error: {e}")
+            log.error(f"RKNN NPU preprocess error: {e}")
             return []
 
-        if not outputs:
+        # NPU 推理
+        try:
+            output = self._npu.run(input_data)
+        except Exception as e:
+            log.error(f"RKNN NPU inference error: {e}")
+            # NPU 出错时尝试重置（仅记录，不崩溃）
+            return []
+
+        if output is None:
             return []
 
         # 后处理
-        output = outputs[0]
-        return yolo_postprocess(
-            output,
-            input_shape=(in_w, in_h),
-            frame_shape=frame.shape,
-            conf_threshold=self.conf_threshold,
-            nms_threshold=self.nms_threshold,
-            num_classes=self.num_classes,
-        )
+        try:
+            return yolo_postprocess(
+                output,
+                input_shape=(in_w, in_h),
+                frame_shape=frame.shape,
+                conf_threshold=self.conf_threshold,
+                nms_threshold=self.nms_threshold,
+                num_classes=self.num_classes,
+                letterbox_params=letterbox_params,
+                class_names=self.class_names,
+            )
+        except Exception as e:
+            log.error(f"RKNN NPU postprocess error: {e}")
+            return []
 
-    def _preprocess(self, frame: np.ndarray,
-                    target_size: Tuple[int, int]) -> Tuple[np.ndarray, Tuple[float, float]]:
-        """预处理: resize + normalize + channel transpose."""
+    def _preprocess_npu(self, frame: np.ndarray,
+                        target_size: Tuple[int, int]) -> Tuple[np.ndarray, Tuple[float, float]]:
+        """NPU 预处理: letterbox → 根据模型输入类型输出 uint8 或 float32。
+
+        对于 int8 模型: uint8 NHWC (NPU 内部 normalize)
+        对于 float 模型: float32 NCHW RGB (手动归一化)
+        """
         in_w, in_h = target_size
         f_h, f_w = frame.shape[:2]
 
-        # Letterbox resize (保持宽高比, 填充灰边)
-        scale = min(in_w / f_w, in_h / f_h)
-        new_w, new_h = int(f_w * scale), int(f_h * scale)
+        # Letterbox resize (保持宽高比, 填充灰边 114)
+        scale_val = min(in_w / f_w, in_h / f_h)
+        new_w, new_h = int(f_w * scale_val), int(f_h * scale_val)
         resized = cv2.resize(frame, (new_w, new_h))
 
-        # 创建 letterbox 画布 (BGR, 填充 114)
+        # 画布 (BGR, 填充 114)
         letterbox = np.full((in_h, in_w, 3), 114, dtype=np.uint8)
         dx = (in_w - new_w) // 2
         dy = (in_h - new_h) // 2
         letterbox[dy:dy + new_h, dx:dx + new_w] = resized
 
-        # BGR → RGB, HWC → CHW, uint8 → float32, /255
-        blob = letterbox[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
-        blob = np.expand_dims(blob, axis=0)  # (1, 3, H, W)
+        # 根据模型类型选择输出格式
+        if self._npu is not None and hasattr(self._npu, '_input_attr'):
+            out_attr = self._npu._output_attrs[0] if self._npu._output_attrs else {}
+            if out_attr.get('dtype') != 2:  # dtype=2 is int8 → float model
+                # Float 模型: 手动 BGR→RGB + normalize, 保持 NHWC
+                # NPU normalize 只支持 NHWC, 但 mean=[0,0,0] std=[1,1,1] 是恒等变换
+                # 关键: 必须转 RGB (与 ONNX 训练一致)，否则分类头输出错误
+                blob = letterbox[:, :, ::-1].astype(np.float32) / 255.0  # BGR→RGB + normalize
+                blob = np.expand_dims(blob, axis=0)  # (1, H, W, 3) NHWC float32 RGB
+                return blob, (scale_val, dx, dy)
 
-        return blob, (scale, dx, dy)
+        # Int8 模型: NHWC uint8 (NPU 内部 normalize + BGR→RGB via quant_img_RGB2BGR)
+        blob = np.expand_dims(letterbox, axis=0)  # (1, H, W, 3)
+        return blob, (scale_val, dx, dy)
 
     def release(self):
-        if self._rknn:
-            self._rknn.release()
-            self._rknn = None
+        if self._npu:
+            self._npu.release()
+            self._npu = None
 
     def __del__(self):
         self.release()
@@ -404,12 +460,13 @@ class ONNXDetector:
 
     def __init__(self, model_path: str, input_size: Tuple[int, int] = (640, 640),
                  conf_threshold: float = 0.5, nms_threshold: float = 0.4,
-                 num_classes: int = 8):
+                 num_classes: int = 8, class_names: list = None):
         self.model_path = model_path
         self.input_size = input_size
         self.conf_threshold = conf_threshold
         self.nms_threshold = nms_threshold
         self.num_classes = num_classes
+        self.class_names = class_names
         self._session = None
         self._input_name = None
         self._output_names = None
@@ -453,7 +510,11 @@ class ONNXDetector:
         in_w, in_h = self.input_size
 
         # 预处理
-        input_data, _ = self._preprocess(frame, (in_w, in_h))
+        try:
+            input_data, letterbox_params = self._preprocess(frame, (in_w, in_h))
+        except Exception as e:
+            log.error(f"ONNX preprocess error: {e}")
+            return []
 
         # 推理
         try:
@@ -468,16 +529,22 @@ class ONNXDetector:
         if not outputs:
             return []
 
-        # 后处理 — 使用第一个输出
-        output = outputs[0]
-        return yolo_postprocess(
-            output,
-            input_shape=(in_w, in_h),
-            frame_shape=frame.shape,
-            conf_threshold=self.conf_threshold,
-            nms_threshold=self.nms_threshold,
-            num_classes=self.num_classes,
-        )
+        # 后处理
+        try:
+            output = outputs[0]
+            return yolo_postprocess(
+                output,
+                input_shape=(in_w, in_h),
+                frame_shape=frame.shape,
+                conf_threshold=self.conf_threshold,
+                nms_threshold=self.nms_threshold,
+                num_classes=self.num_classes,
+                letterbox_params=letterbox_params,
+                class_names=self.class_names,
+            )
+        except Exception as e:
+            log.error(f"ONNX postprocess error: {e}")
+            return []
 
     def _preprocess(self, frame: np.ndarray,
                     target_size: Tuple[int, int]) -> Tuple[np.ndarray, Tuple[float, float]]:
@@ -601,9 +668,11 @@ class SpriteDetector:
         """
         self.config = config
 
-        # 类别配置
+        # 类别配置 — 支持自定义类别名（单类模型时用）
         self.classes = config.get("classes", DEFAULT_CLASSES)
         self.num_classes = len(self.classes)
+        # 如果配置的 classes 与 DEFAULT_CLASSES 不同（如单类模型），传给后处理
+        class_names = self.classes if self.classes != DEFAULT_CLASSES else None
 
         # YOLO (RKNN)
         self._rknn: Optional[RKNNDetector] = None
@@ -615,6 +684,7 @@ class SpriteDetector:
                 conf_threshold=config.get("conf_threshold", 0.5),
                 nms_threshold=config.get("nms_threshold", 0.4),
                 num_classes=self.num_classes,
+                class_names=class_names,
             )
             log.info(f"Attempting to load RKNN model: {rknn_path}")
             if not self._rknn.load():
@@ -632,6 +702,7 @@ class SpriteDetector:
                     conf_threshold=config.get("conf_threshold", 0.5),
                     nms_threshold=config.get("nms_threshold", 0.4),
                     num_classes=self.num_classes,
+                    class_names=class_names,
                 )
                 if not self._onnx.load():
                     log.warning("ONNX load failed, will use motion detection")
@@ -650,6 +721,9 @@ class SpriteDetector:
             threshold=tc.get("match_threshold", 0.7),
         )
 
+        # NPU 推理锁（多线程共享时防止同时推理）
+        self._inference_lock = threading.Lock()
+
         # 统计
         self._inference_time = 0.0
         self._detect_count = 0
@@ -661,31 +735,29 @@ class SpriteDetector:
     def detect(self, frame: np.ndarray) -> List[dict]:
         """
         执行检测。返回统一的检测结果列表。
-
-        Returns:
-            [{"bbox": (x1,y1,x2,y2), "class": str, "confidence": float,
-              "source": "yolo"|"motion"|"template", "name": str?}, ...]
+        线程安全：NPU 推理加锁防止多线程同时调用。
         """
         all_detections = []
 
         t_start = time.perf_counter()
 
-        # YOLO 检测
-        if self._rknn:
-            dets = self._rknn.detect(frame)
-            for d in dets:
-                d["source"] = "rknn_yolo"
-            all_detections.extend(dets)
+        # YOLO 检测（NPU/ONNX 加锁防止多线程同时推理）
+        with self._inference_lock:
+            if self._rknn:
+                dets = self._rknn.detect(frame)
+                for d in dets:
+                    d["source"] = "rknn_yolo"
+                all_detections.extend(dets)
 
-        elif self._onnx:
-            dets = self._onnx.detect(frame)
-            for d in dets:
-                d["source"] = "onnx_yolo"
-            all_detections.extend(dets)
+            elif self._onnx:
+                dets = self._onnx.detect(frame)
+                for d in dets:
+                    d["source"] = "onnx_yolo"
+                all_detections.extend(dets)
 
-        elif self._motion:
-            dets = self._motion.detect(frame)
-            all_detections.extend(dets)
+            elif self._motion:
+                dets = self._motion.detect(frame)
+                all_detections.extend(dets)
 
         # 模板匹配 (始终运行，与 YOLO 互补)
         tmpl_results = self._templates.detect(frame)

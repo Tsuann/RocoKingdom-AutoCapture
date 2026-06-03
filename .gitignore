@@ -7,6 +7,8 @@ venv/
 
 # Models (large binary files)
 models/*.rknn
+models/*.rknn.bak
+models/*.rknn.broken
 models/*.onnx
 models/*.pt
 
@@ -23,6 +25,16 @@ logs/*.log
 # IDE
 .vscode/
 .idea/
+
+# Diagnostic & temp files
+calib_*
+check*.onnx
+*_test.png
+*_debug*.png
+diag_*.png
+npu_detection_test.png
+test_*.png
+*.tmp.*
 
 # OS
 .DS_Store

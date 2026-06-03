@@ -9,6 +9,8 @@
 
 from typing import Dict, List, Optional, Tuple
 
+import threading
+
 import cv2
 import numpy as np
 
@@ -141,63 +143,66 @@ class MultiTracker:
         self._trackers: Dict[int, KalmanTracker] = {}
         self._next_id = 0
         self._current_target_id: Optional[int] = None
+        self._lock = threading.Lock()
 
     def update(self, detections: List[dict]) -> List[dict]:
-        """
-        用新的检测结果更新所有追踪器。
+        """线程安全的检测更新。"""
+        with self._lock:
+            for tracker in self._trackers.values():
+                tracker.predict()
 
-        Args:
-            detections: 检测结果列表，每个元素含 "bbox" 和 "class"
+            if len(detections) > 0 and len(self._trackers) > 0:
+                matches, unmatched_det, unmatched_trk = self._match_iou(detections)
+            else:
+                matches = []
+                unmatched_det = list(range(len(detections)))
+                unmatched_trk = list(self._trackers.keys())
 
-        Returns:
-            增强后的检测结果列表，含 tracker_id, predicted_position 等
-        """
-        # Step 1: 所有追踪器预测
-        for tracker in self._trackers.values():
-            tracker.predict()
+            for det_idx, trk_id in matches:
+                det = detections[det_idx]
+                center = bbox_center(det["bbox"])
+                self._trackers[trk_id].update(center)
+                det["tracker_id"] = trk_id
+                det["predicted_position"] = self._trackers[trk_id].predicted
+                det["smoothed_position"] = self._trackers[trk_id].smoothed
 
-        # Step 2: 检测结果与追踪器匹配 (IoU)
-        if len(detections) > 0 and len(self._trackers) > 0:
-            matches, unmatched_det, unmatched_trk = self._match_iou(detections)
-        else:
-            matches = []
-            unmatched_det = list(range(len(detections)))
-            unmatched_trk = list(self._trackers.keys())
+            for det_idx in unmatched_det:
+                det = detections[det_idx]
+                center = bbox_center(det["bbox"])
+                trk_id = self._next_id
+                self._next_id += 1
+                self._trackers[trk_id] = KalmanTracker(
+                    trk_id, center, self.process_noise, self.measurement_noise)
+                det["tracker_id"] = trk_id
+                det["predicted_position"] = center
+                det["smoothed_position"] = center
 
-        # Step 3: 更新匹配的追踪器
-        for det_idx, trk_id in matches:
-            det = detections[det_idx]
-            center = bbox_center(det["bbox"])
-            self._trackers[trk_id].update(center)
-            det["tracker_id"] = trk_id
-            det["predicted_position"] = self._trackers[trk_id].predicted
-            det["smoothed_position"] = self._trackers[trk_id].smoothed
+            for trk_id in unmatched_trk:
+                self._trackers[trk_id].mark_missed()
 
-        # Step 4: 为新检测创建追踪器
-        for det_idx in unmatched_det:
-            det = detections[det_idx]
-            center = bbox_center(det["bbox"])
-            trk_id = self._next_id
-            self._next_id += 1
-            self._trackers[trk_id] = KalmanTracker(
-                trk_id, center, self.process_noise, self.measurement_noise
-            )
-            det["tracker_id"] = trk_id
-            det["predicted_position"] = center
-            det["smoothed_position"] = center
+            lost_ids = [tid for tid, t in self._trackers.items() if t.is_lost]
+            for tid in lost_ids:
+                del self._trackers[tid]
+                if self._current_target_id == tid:
+                    self._current_target_id = None
 
-        # Step 5: 标记未匹配的追踪器为丢失
-        for trk_id in unmatched_trk:
-            self._trackers[trk_id].mark_missed()
+            return detections
 
-        # Step 6: 清理超时追踪器
-        lost_ids = [tid for tid, t in self._trackers.items() if t.is_lost]
-        for tid in lost_ids:
-            del self._trackers[tid]
-            if self._current_target_id == tid:
-                self._current_target_id = None
-
-        return detections
+    def get_active_detections(self) -> List[dict]:
+        """线程安全地获取活跃追踪器的检测信息（用于显示）。"""
+        with self._lock:
+            result = []
+            for tid, t in self._trackers.items():
+                if t.disappeared > 0:
+                    continue
+                sx, sy = t.smoothed
+                result.append({
+                    "bbox": (int(sx-30), int(sy-30), int(sx+30), int(sy+30)),
+                    "class": "tracked",
+                    "confidence": 1.0,
+                    "tracker_id": tid,
+                })
+            return result
 
     # ----------------------------------------------------------
     # 目标选择
